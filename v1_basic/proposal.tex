@@ -1,0 +1,101 @@
+\documentclass[11pt]{article}
+
+% --- Packages ---
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{booktabs} % For professional tables
+\usepackage{enumitem} % For better control over lists
+\usepackage{hyperref} % For clickable references
+
+% --- Title Information ---
+\title{Emergence of Imperative Syntax: Enforcing Compositionality via Functional Asymmetry and Channel Sparsity in Multi-Agent Reinforcement Learning}
+\author{Research Proposal: The ``Heist'' Protocol - Version 2.0}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Problem Statement: The ``Reference vs. Agency'' Gap}
+Current research in Emergent Communication focuses almost exclusively on \textbf{Reference}—agents agreeing on names for static objects (e.g., ``That is a red ball'') \cite{1}. While successful, these methods often result in holistic ``bag-of-words'' protocols that lack grammar. 
+
+They fail to capture \textbf{Agency}—the use of language to control, plan, and execute actions through others. Standard Multi-Agent Reinforcement Learning (MARL) environments rely on \textbf{Informational Constraints} (private goals) to drive communication \cite{2}. We argue this is insufficient for complex syntax. To evolve a language with verbs, prepositions, and logic, agents require \textbf{Functional Constraints}: a strict separation between Planning (The ``Brain'') and Execution (The ``Body'').
+
+\section{Hypothesis}
+Strict \textbf{Functional Asymmetry} (separating a global ``Seer'' from a local ``Doer''), combined with \textbf{Channel Sparsity} and \textbf{Finite Scalar Quantization (FSQ)}, will drive the emergence of a consistent, compositional imperative syntax (Verb-Object-Modifier) that outperforms holistic protocols in zero-shot generalization tasks.
+
+\section{Methodology: The ``Heist'' Environment}
+We propose a custom MiniGrid environment designed to force the decomposition of complex plans into real-time instructions.
+
+\subsection{The Functional Asymmetry (The ``Brain'' \& ``Body'' Split)}
+\begin{itemize}
+    \item \textbf{Agent A (``The Hacker/Seer''):} Possesses a global view of the map, target locations, and guard patrols. \textit{Constraint:} Cannot move or physically interact with the world.
+    \item \textbf{Agent B (``The Thief/Doer''):} Can move, pick up keys, and open doors. \textit{Constraint:} Has ``Keyhole Vision'' (only sees a $3 \times 3$ local grid). 
+\end{itemize}
+Crucially, the Thief's orientation is randomized relative to the Hacker, preventing the Hacker from simply transmitting global coordinates (e.g., ``Go to (5,3)'') \cite{3}. 
+
+\textbf{The Conflict:} The Hacker sees where to go, but only the Thief sees local hazards (e.g., slippery tiles, traps) in the immediate path. This forces a dialogue of \textbf{Intent} rather than Micro-Management.
+
+\subsection{The Task: Stochastic Infiltration}
+\begin{itemize}
+    \item \textbf{Objective:} Retrieve a specific object (e.g., ``Blue Key'') and exit.
+    \item \textbf{Dynamic Complexity:} Unlike static grid worlds, patrol routes and trap locations are stochastic. The Hacker must issue real-time updates (verbs) to navigate the Thief through changing dangers.
+\end{itemize}
+
+\section{Technical Architecture}
+
+\subsection{Finite Scalar Quantization (FSQ) with Sparsity}
+We replace Gumbel-Softmax with FSQ to enforce rigid discreteness in the communication channel. 
+
+\textbf{The Structure:} Continuous thought vectors are projected into a discrete hypercube $L^d$.
+
+\textbf{The Pressure (Novelty):} To prevent agents from mapping 125 unique holistic meanings to the grid, we impose a \textbf{Sparsity Penalty} (similar to the Dirichlet Process \cite{4}) on the number of unique FSQ codes used per episode. This punishes large vocabularies and forces the reuse of atomic codes (``Left'', ``Red'') in new combinations.
+
+\subsection{Curriculum \& Iterated Learning}
+To avoid local minima where agents settle for ``grunt'' languages:
+\begin{enumerate}
+    \item \textbf{Phase 1 (Nouns):} Static fetch tasks (Learn ``Red'', ``Key'').
+    \item \textbf{Phase 2 (Verbs):} Navigation through hazards (Learn ``Wait'', ``Go'', ``Avoid'').
+    \item \textbf{Phase 3 (Syntax):} The full ``Heist'' with novel combinations.
+\end{enumerate}
+\textbf{Role Swapping:} Agents randomly swap roles (Hacker $\leftrightarrow$ Thief) between episodes. This ensures symbols represent general concepts rather than specific partner-dependent macros.
+
+\section{Evaluation Strategy}
+
+\subsection{Tree Reconstruction Error (TRE)}
+We will train a supervised diagnostic probe to map agent messages to ground-truth syntax trees (Action-Object-Modifier). Low error indicates the language is explicitly compositional, not just functionally sufficient.
+
+\subsection{The ``Breaking Point'' Robustness Test}
+We will measure success rates as the number of unique object-color combinations scales ($N$).
+\begin{itemize}
+    \item \textbf{Prediction 1:} Holistic baselines will crash as $N$ exceeds vocabulary size.
+    \item \textbf{Prediction 2:} Our Compositional agents will maintain performance by recombining known atoms.
+\end{itemize}
+
+\section{Risks \& Mitigations}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lp{0.6\textwidth}@{}}
+\toprule
+\textbf{Critique} & \textbf{Mitigation Strategy} \\ \midrule
+``LLMs already solve this.'' & This research isolates the minimal conditions required for syntax to emerge, which is impossible to study in pre-trained LLMs. \\ \addlinespace
+``GridWorlds are too simple.'' & Complexity is in the dynamics. We will prove relevance via the Robustness Test, showing our method scales where baselines fail. \\ \addlinespace
+``Agents will share coordinates.'' & Randomized Reference Frames ensure ``North'' for the Hacker is different from ``Forward'' for the Thief, forcing semantic instructions \cite{5}. \\ \addlinespace
+``Information smuggling via jitter.'' & We will inject \textbf{Channel Noise} (1\% drop rate). True symbolic language is robust to noise; analog ``smuggling'' is not. \\ \bottomrule
+\end{tabular}
+\end{table}
+
+\section{Conclusion}
+The ``Heist'' Protocol challenges the ``Noun Bias'' in AI by shifting focus to \textbf{Imperative Syntax}. By enforcing functional asymmetry and representational bottlenecks, we aim to demonstrate that grammar is a functional necessity for distributed intelligence.
+
+\begin{thebibliography}{9}
+\bibitem{1} Reference 1 Placeholder
+\bibitem{2} Mordatch et al. (MARL Informational Constraints)
+\bibitem{3} Reference 3 Placeholder
+\bibitem{4} Mordatch et al. (Dirichlet Process Sparsity)
+\bibitem{5} Reference 5 Placeholder
+\end{thebibliography}
+
+\end{document}
