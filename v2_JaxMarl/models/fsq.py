@@ -33,7 +33,12 @@ class FSQ(nn.Module):
         z_scaled = z_bound * half_width + half_width
         
         # 3. Quantization: Snap to the nearest integer grid point.
-        z_quantized = jnp.round(z_scaled)
+        if self.has_rng('noise'):
+            # Inject uniform noise during training to "shake" the FSQ and prevent early mode collapse
+            noise = jax.random.uniform(self.make_rng('noise'), z_scaled.shape, minval=-0.2, maxval=0.2)
+            z_quantized = jnp.round(z_scaled + noise)
+        else:
+            z_quantized = jnp.round(z_scaled)
         
         # 4. Straight-Through Estimator (STE) Trick in JAX
         # Forward pass: Evaluates to z_quantized.

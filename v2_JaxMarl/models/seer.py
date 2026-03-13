@@ -57,9 +57,12 @@ class Seer(nn.Module):
         new_carry, lstm_out = lstm_cell(carry, fused_features)
         
         # 5. Continuous Projection
-        # Project the LSTM output to the exact number of dimensions (d) required by FSQ
-        d = len(self.fsq_levels)
-        thought_vector = nn.Dense(features=d)(lstm_out)
+        # Project LSTM hidden state to continuous vector z of size d.
+        # Use Orthogonal init with higher scale to prevent FSQ mode collapse.
+        thought_vector = nn.Dense(
+            features=len(self.fsq_levels),
+            kernel_init=nn.initializers.orthogonal(scale=2.0)
+        )(lstm_out)
         
         # 6. Output Head: FSQ Discretizer 
         # Transforms the continuous thought vector into the discrete message $m_t$ 

@@ -6,8 +6,9 @@ from training.gae import compute_gae
 
 # Assuming Transition is imported from your mappo.py or a shared datatypes file
 from agents.mappo import Transition 
+from eval.metrics import compute_cic
 
-def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
+def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn, vision_radius: jnp.ndarray):
     """
     A closure that returns the JAX-compilable step function.
     Passing the environment and apply functions here avoids passing them 
@@ -28,8 +29,8 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         # 1. Seer Forward Pass (Prefrontal Cortex)
         # Enforcing CTDE: Seer gets the global view[cite: 131, 132].
         # In a custom jaxmarl wrapper, you would extract these from env_obs
-        global_map = env_obs["global_map"] 
-        symbolic_obs = env_obs["symbolic_state"]
+        global_map = env_obs["global_map"][None, ...] 
+        symbolic_obs = env_obs["symbolic_state"][None, ...]
         
         next_seer_carry, discrete_message, _ = seer_apply_fn(
             {"params": params["seer"]}, 
@@ -40,8 +41,8 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         
         # 2. Doer Forward Pass (Motor Cortex)
         # Enforcing Functional Asymmetry: Doer gets local view and the message[cite: 137, 138].
-        local_obs = env_obs["local_view"]
-        proprioception = env_obs["proprioception"]
+        local_obs = env_obs["local_view"][None, ...]
+        proprioception = env_obs["proprioception"][None, ...]
         
         next_doer_carry, action_logits = doer_apply_fn(
             {"params": params["doer"]}, 
@@ -52,26 +53,29 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         )
         
         # 3. Action Selection via Distrax
-        pi = distrax.Categorical(logits=action_logits)
+        pi = distrax.Categorical(logits=action_logits[0])
         action = pi.sample(seed=doer_rng)
         log_prob = pi.log_prob(action)
         
         # 4. Critic Forward Pass (Centralized Training)
         # The critic evaluates the global state to guide learning[cite: 111].
-        value = critic_apply_fn({"params": params["critic"]}, global_map)
+        value = critic_apply_fn({"params": params["critic"]}, global_map)[0]
         
         # 5. Environment Step
         # Step the jaxmarl environment using the chosen action
         # Note: jaxmarl expects a dictionary of actions for multi-agent, 
         # adapt this based on your specific wrapper implementation.
         next_env_obs, next_env_state, reward, done, info = env.step(
-            rng, env_state, action
+            rng, env_state, action, vision_radius=vision_radius
         )
         
         # 6. Build the Transition
         transition = Transition(
-            global_obs=global_map,
-            local_obs=local_obs,
+            global_obs=global_map[0],
+            symbolic_obs=symbolic_obs[0],
+            local_obs=local_obs[0],
+            proprioception=proprioception[0],
+            message=discrete_message[0],
             action=action,
             log_prob=log_prob,
             value=value.squeeze(),
@@ -91,10 +95,12 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
 
     return rollout_step
 
-@jax.jit # We can now JIT compile this entire trajectory generation function
+import functools
+
+@functools.partial(jax.jit, static_argnames=("num_steps", "step_fn", "critic_apply_fn", "doer_apply_fn"))
 def generate_trajectory_and_gae(
     params, rng, env_obs, env_state, seer_carry, doer_carry, num_steps: int, 
-    step_fn, critic_apply_fn
+    step_fn, critic_apply_fn, doer_apply_fn
 ):
     """
     Executes the full episode rollout and computes GAE in a single compiled pass.
@@ -113,18 +119,31 @@ def generate_trajectory_and_gae(
     _, _, _, _, final_env_obs, _ = final_runner_state
     
     # Enforce CTDE: The critic evaluates the global map 
-    final_global_map = final_env_obs["global_map"] 
+    final_global_map = final_env_obs["global_map"][None, ...] 
     
     # 3. Calculate the bootstrap value (last_val)
     # The critic evaluates the state *after* the final step
     last_val = critic_apply_fn({"params": params["critic"]}, final_global_map).squeeze()
     
-    # 4. Compute GAE
+    # 4. Compute CIC and Intrinsic Reward
+    rng, cic_rng = jax.random.split(rng)
+    cic_score = compute_cic(
+        doer_apply_fn,
+        params["doer"],
+        trajectory_batch,
+        doer_carry,
+        cic_rng
+    )
+    
+    w_cic = 0.1
+    reward_with_cic = trajectory_batch.reward + w_cic * cic_score
+    
+    # 5. Compute GAE
     # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 
     # compute_gae with jax.vmap(compute_gae, in_axes=1, out_axes=1) to vectorize 
     # the advantage calculation across all environments simultaneously.
     advantages, returns = compute_gae(
-        rewards=trajectory_batch.reward,
+        rewards=reward_with_cic,
         values=trajectory_batch.value,
         dones=trajectory_batch.done,
         last_val=last_val,

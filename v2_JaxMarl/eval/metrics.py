@@ -1,96 +1,52 @@
 import jax
 import jax.numpy as jnp
-import numpy as np
-from scipy.spatial.distance import pdist
-from scipy.stats import spearmanr
-from typing import Callable, Dict, Any, Tuple
+from typing import Tuple, Callable
+import functools
 
-def compute_topographic_similarity(
-    states: np.ndarray, 
-    messages: np.ndarray, 
-    metric: str = 'cosine'
-) -> float:
+@functools.partial(jax.jit, static_argnames=("doer_apply_fn",))
+def compute_cic(
+    doer_apply_fn: Callable,
+    doer_params: dict,
+    transition_batch, 
+    init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray],
+    rng: jax.random.PRNGKey
+) -> jnp.ndarray:
     """
-    Computes the Topographic Similarity (TopSim) between states and messages.
-    A high score indicates a compositional language.
+    Computes Causal Influence of Communication (CIC) by ablating the Seer's message
+    and measuring the divergence in the Doer's resulting deterministic actions.
+    """
     
-    Args:
-        states: An array of flattened global states or semantic representations.
-                Shape: (num_samples, state_dim).
-        messages: An array of the generated FSQ message vectors.
-                  Shape: (num_samples, message_dim).
-        metric: The distance metric to use ('cosine', 'euclidean', etc.).
+    def scan_fn(carry, step_data):
+        doer_carry = carry
+        msg, loc, prop = step_data
         
-    Returns:
-        rho: The Spearman rank correlation coefficient between the distance matrices.
-    """
-    # 1. Compute pairwise distance matrices
-    # pdist returns a condensed 1D array of distances, which is perfect for correlation
-    d_state = pdist(states, metric=metric)
-    d_message = pdist(messages, metric=metric)
-    
-    # 2. Compute correlation
-    # We use Spearman rank correlation as the relationship between state-space
-    # distances and message-space distances is rarely perfectly linear.
-    rho, _ = spearmanr(d_state, d_message)
-    
-    return float(rho)
+        next_doer_carry, logits = doer_apply_fn(
+            {"params": doer_params},
+            doer_carry,
+            loc,
+            prop,
+            msg
+        )
+        return next_doer_carry, logits
 
-def evaluate_causal_influence_ablation(
-    env_step_fn: Callable,
-    runner_state: Tuple,
-    num_steps: int,
-    noise_std: float = 5.0
-) -> Dict[str, float]:
-    """
-    Executes an ablation study to measure the Causal Influence of Communication (CIC).
-    Replaces the communication channel with Gaussian noise to test for causal dependency.
-    
-    Args:
-        env_step_fn: The compiled JAX rollout step function.
-        runner_state: The initialized state tuple for the rollout.
-        num_steps: How many steps to run the evaluation.
-        noise_std: The standard deviation of the Gaussian noise to inject.
-        
-    Returns:
-        A dictionary comparing baseline reward to ablated reward.
-    """
-    # This is a conceptual template. In a full implementation, you would 
-    # modify your env_step_fn to accept an 'ablation_mode' boolean flag.
-    # When ablation_mode is True, the 'discrete_message' passed to the Doer
-    # is replaced with jax.random.normal(rng, shape) * noise_std.
-    
-    # 1. Run baseline trajectory
-    # final_state, baseline_traj = jax.lax.scan(env_step_fn, runner_state, None, num_steps)
-    # baseline_reward = baseline_traj.reward.sum()
-    
-    # 2. Run ablated trajectory (with noise injected into the message channel)
-    # final_state, ablated_traj = jax.lax.scan(ablated_step_fn, runner_state, None, num_steps)
-    # ablated_reward = ablated_traj.reward.sum()
-    
-    # Placeholder return
-    return {
-        "baseline_return": 0.0,
-        "ablated_return": 0.0,
-        "causal_drop": 0.0 # baseline_return - ablated_return
-    }
+    # Transition batch shapes: (seq_len, ...) from loop.py
+    # We add batch dim of 1 for the network inputs
+    loc = transition_batch.local_obs[:, None, ...]
+    prop = transition_batch.proprioception[:, None, ...]
+    msg_true = transition_batch.message[:, None, ...]
 
-def check_zero_shot_generalization(
-    executed_action: int, 
-    target_object_id: int, 
-    holdout_pairs: set
-) -> bool:
-    """
-    Validates if the agent successfully executed a command on a held-out combination.
+    # True forward pass
+    _, true_logits = jax.lax.scan(scan_fn, init_doer_carry, (msg_true, loc, prop))
     
-    Args:
-        executed_action: The discrete action taken by the Doer.
-        target_object_id: The ID of the object interacted with.
-        holdout_pairs: A set of tuples defining the (action, object) pairs 
-                       never seen during training.
-                       
-    Returns:
-        True if the combination is in the holdout set, False otherwise.
-    """
-    combination = (executed_action, target_object_id)
-    return combination in holdout_pairs
+    # Ablated forward pass (shuffle messages over time)
+    msg_shuffled = jax.random.permutation(rng, msg_true, independent=True)
+    
+    _, ablated_logits = jax.lax.scan(scan_fn, init_doer_carry, (msg_shuffled, loc, prop))
+    
+    # Calculate CIC: divergence in deterministic policy
+    true_actions = jnp.argmax(true_logits, axis=-1)
+    ablated_actions = jnp.argmax(ablated_logits, axis=-1)
+    
+    cic = jnp.mean((true_actions != ablated_actions).astype(jnp.float32))
+    
+    return cic

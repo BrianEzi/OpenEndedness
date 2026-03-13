@@ -34,20 +34,11 @@ class Doer(nn.Module):
         """
         
         # 1. Message Encoder: Learned Lookup Table
-        # The message is a vector of length d (e.g., [1.0, 4.0, 0.0]). 
-        # We cast to integer and embed each dimension separately, then flatten.
-        message_int = message.astype(jnp.int32)
-        embedded_dims = []
-        
-        for i, num_levels in enumerate(self.fsq_levels):
-            # Each dimension of the FSQ message gets its own embedding space
-            # This respects the factored nature of the quantized vector
-            emb = nn.Embed(num_embeddings=num_levels, features=self.embed_dim)
-            # Extract the i-th dimension across the batch
-            embedded_dims.append(emb(message_int[:, i]))
-            
-        # Concatenate all embedded dimensions into a single vector per batch item
-        message_features = jnp.concatenate(embedded_dims, axis=-1)
+        # To preserve gradients, we MUST NOT cast to int and use nn.Embed directly 
+        # Instead, FSQ naturally provides continuous coordinates (that happen to be quantized).
+        # We can just linearly project this entire vector directly into a latent space!
+        message_features = nn.Dense(features=self.embed_dim * len(self.fsq_levels))(message)
+        message_features = nn.relu(message_features)
         
         # 2. Local Visual Encoder
         # Even for a small 3x3 grid, a single convolution or a dense layer extracts features
