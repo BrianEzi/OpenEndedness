@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import distrax
 from typing import Tuple, Any, Dict
+from training.gae import compute_gae 
 
 # Assuming Transition is imported from your mappo.py or a shared datatypes file
 from agents.mappo import Transition 
@@ -90,28 +91,52 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
 
     return rollout_step
 
-def generate_trajectory(
-    env, params, rng, num_steps: int, seer_apply_fn, doer_apply_fn, critic_apply_fn
+@jax.jit # We can now JIT compile this entire trajectory generation function
+def generate_trajectory_and_gae(
+    params, rng, env_obs, env_state, seer_carry, doer_carry, num_steps: int, 
+    step_fn, critic_apply_fn
 ):
-    """Compiles and executes the full episode rollout."""
-    
-    # Initialize environment
-    rng, env_rng = jax.random.split(rng)
-    env_obs, env_state = env.reset(env_rng)
-    
-    # Initialize LSTM states (assuming a batch size of 1 for a single env instance)
-    seer_carry = seer_apply_fn.initialize_carry(batch_size=1, hidden_size=128)
-    doer_carry = doer_apply_fn.initialize_carry(batch_size=1, hidden_size=128)
-    
+    """
+    Executes the full episode rollout and computes GAE in a single compiled pass.
+    Note: We pass the pre-compiled step_fn and initial states directly here 
+    for better JAX compilation efficiency.
+    """
     initial_runner_state = (params, seer_carry, doer_carry, env_state, env_obs, rng)
     
-    # Create the compiled step function
-    step_fn = make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn)
-    
-    # Execute the scan loop
-    # jax.lax.scan returns the final state and a stacked array of all transitions
+    # 1. Execute the scan loop to collect the raw trajectory
     final_runner_state, trajectory_batch = jax.lax.scan(
         step_fn, initial_runner_state, None, length=num_steps
+    )
+    
+    # 2. Extract the final state for Critic bootstrapping
+    # Unpack the final runner state to get the last env_obs
+    _, _, _, _, final_env_obs, _ = final_runner_state
+    
+    # Enforce CTDE: The critic evaluates the global map 
+    final_global_map = final_env_obs["global_map"] 
+    
+    # 3. Calculate the bootstrap value (last_val)
+    # The critic evaluates the state *after* the final step
+    last_val = critic_apply_fn({"params": params["critic"]}, final_global_map).squeeze()
+    
+    # 4. Compute GAE
+    # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 
+    # compute_gae with jax.vmap(compute_gae, in_axes=1, out_axes=1) to vectorize 
+    # the advantage calculation across all environments simultaneously.
+    advantages, returns = compute_gae(
+        rewards=trajectory_batch.reward,
+        values=trajectory_batch.value,
+        dones=trajectory_batch.done,
+        last_val=last_val,
+        gamma=0.99,
+        gae_lambda=0.95
+    )
+    
+    # 5. Update the trajectory batch
+    # Using the .replace() method provided by chex/flax dataclasses
+    trajectory_batch = trajectory_batch.replace(
+        advantage=advantages,
+        return_val=returns
     )
     
     return final_runner_state, trajectory_batch
