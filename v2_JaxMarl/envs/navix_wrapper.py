@@ -7,9 +7,15 @@ from navix import observations
 class NavixGridWrapper:
     """Expose Navix single-agent environments with the Seer/Doer observation split."""
 
-    def __init__(self, env, progress_reward_scale: float = 0.1):
+    def __init__(
+        self,
+        env,
+        progress_reward_scale: float = 0.1,
+        min_start_distance: float = 0.0,
+    ):
         self._env = env
         self.progress_reward_scale = progress_reward_scale
+        self.min_start_distance = jnp.asarray(min_start_distance, dtype=jnp.float32)
 
     @property
     def num_actions(self) -> int:
@@ -62,6 +68,24 @@ class NavixGridWrapper:
 
     def reset(self, key: jnp.ndarray, vision_radius: jnp.ndarray = jnp.array(3.0)):
         timestep = self._env.reset(key)
+        distance = self._goal_distance(timestep.state)
+
+        def cond_fn(carry):
+            _, _, goal_distance = carry
+            return goal_distance < self.min_start_distance
+
+        def body_fn(carry):
+            rng, _, _ = carry
+            rng, sample_key = jax.random.split(rng)
+            sampled_timestep = self._env.reset(sample_key)
+            goal_distance = self._goal_distance(sampled_timestep.state)
+            return rng, sampled_timestep, goal_distance
+
+        _, timestep, _ = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (key, timestep, distance),
+        )
         obs = self._split_observations(timestep, vision_radius)
         return obs, timestep
 
@@ -75,20 +99,33 @@ class NavixGridWrapper:
         action: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
     ):
-        del key  # Navix carries the RNG inside the timestep state.
-        old_distance = self._goal_distance(timestep.state)
-        next_timestep = self._env.step(timestep, action)
-        new_distance = self._goal_distance(next_timestep.state)
-        obs = self._split_observations(next_timestep, vision_radius)
-        task_reward = next_timestep.reward.astype(jnp.float32)
-        progress_reward = (old_distance - new_distance) * self.progress_reward_scale
-        reward = task_reward + progress_reward
-        done = next_timestep.is_done()
-        info = dict(next_timestep.info)
-        info["task_reward"] = task_reward
-        info["progress_reward"] = progress_reward
-        info["goal_distance"] = new_distance
-        return obs, next_timestep, reward, done, info
+        def reset_branch(_):
+            reset_obs, reset_timestep = self.reset(key, vision_radius=vision_radius)
+            reward = jnp.asarray(0.0, dtype=jnp.float32)
+            done = jnp.asarray(False)
+            info = {
+                "task_reward": reward,
+                "progress_reward": reward,
+                "goal_distance": self._goal_distance(reset_timestep.state),
+            }
+            return reset_obs, reset_timestep, reward, done, info
+
+        def step_branch(_):
+            old_distance = self._goal_distance(timestep.state)
+            next_timestep = self._env.step(timestep, action)
+            new_distance = self._goal_distance(next_timestep.state)
+            obs = self._split_observations(next_timestep, vision_radius)
+            task_reward = next_timestep.reward.astype(jnp.float32)
+            progress_reward = (old_distance - new_distance) * self.progress_reward_scale
+            reward = task_reward + progress_reward
+            done = next_timestep.is_done()
+            info = dict(next_timestep.info)
+            info["task_reward"] = task_reward
+            info["progress_reward"] = progress_reward
+            info["goal_distance"] = new_distance
+            return obs, next_timestep, reward, done, info
+
+        return jax.lax.cond(timestep.is_done(), reset_branch, step_branch, operand=None)
 
     def step_batch(
         self,

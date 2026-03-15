@@ -37,11 +37,12 @@ def main():
         "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 1_000_000,
-        "env_id": "Navix-Empty-8x8-v0",
+        "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
         "seed": 42,
         "progress_reward_scale": 0.1,
         "cic_coef": 0.01,
+        "min_start_distance": 6.0,
         "visualize_every": 50,
         "visualize_max_steps": 200,
         "visualize_dir": "artifacts/episodes",
@@ -56,7 +57,11 @@ def main():
 
     # 3. Environment Instantiation
     raw_env = nx.make(config["env_id"])
-    env = NavixGridWrapper(raw_env, progress_reward_scale=config["progress_reward_scale"])
+    env = NavixGridWrapper(
+        raw_env,
+        progress_reward_scale=config["progress_reward_scale"],
+        min_start_distance=config["min_start_distance"],
+    )
 
     # 4. Initial Environment Reset
     rng, env_rng = jax.random.split(rng, 2)
