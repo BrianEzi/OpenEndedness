@@ -9,6 +9,7 @@ optax==0.2.7
 chex==0.1.90
 distrax==0.1.5
 jaxmarl==0.0.7
+navix==0.7.4
 wandb==0.25.1
 numpy==1.26.4
 pillow==12.1.1

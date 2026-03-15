@@ -70,6 +70,16 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         next_env_obs, next_env_state, reward, done, info = env.step_batch(
             env_step_keys, env_state, action, vision_radius=vision_radius
         )
+
+        done_mask = done[:, None]
+        next_seer_carry = jax.tree_util.tree_map(
+            lambda x: jnp.where(done_mask, jnp.zeros_like(x), x),
+            next_seer_carry,
+        )
+        next_doer_carry = jax.tree_util.tree_map(
+            lambda x: jnp.where(done_mask, jnp.zeros_like(x), x),
+            next_doer_carry,
+        )
         
         # 6. Build the Transition
         transition = Transition(

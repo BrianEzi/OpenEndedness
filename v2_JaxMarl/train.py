@@ -2,19 +2,16 @@ import jax
 import jax.numpy as jnp
 import optax
 from pathlib import Path
-# import wandb
 import flax.linen as nn
 from flax.training.train_state import TrainState
 
 # Import our custom modules
 from models.seer import Seer
 from models.doer import Doer
-from envs.wrappers import AsymmetricOvercookedWrapper
+from envs.navix_wrapper import NavixGridWrapper
 from training.loop import generate_trajectory_and_gae, make_rollout_step
 from agents.mappo import update_actor, update_critic, Transition
-import jaxmarl
-from jaxmarl.environments.overcooked import overcooked_layouts
-import wandb
+import navix as nx
 from eval.metrics import compute_cic
 from eval.visualize import visualize_episode
 import numpy as np
@@ -40,6 +37,7 @@ def main():
         "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 1_000_000,
+        "env_id": "Navix-Empty-Random-6x6-v0",
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
         "seed": 42,
         "visualize_every": 50,
@@ -55,17 +53,14 @@ def main():
     rng, seer_init_rng, doer_init_rng, critic_init_rng, env_rng = jax.random.split(rng, 5)
 
     # 3. Environment Instantiation
-    # Instantiate the jaxmarl Overcooked environment
-    # We use a simple layout for testing
-    layout = overcooked_layouts["cramped_room"]
-    raw_env = jaxmarl.make("overcooked", layout=layout)
-    env = AsymmetricOvercookedWrapper(raw_env)
+    raw_env = nx.make(config["env_id"])
+    env = NavixGridWrapper(raw_env)
 
     # 4. Initial Environment Reset
     rng, env_rng = jax.random.split(rng, 2)
     reset_keys = jax.random.split(env_rng, config["num_envs"])
-    # Give initial full vision radius of 2.0
-    env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(2.0))
+    # Give initial full vision radius of 3.0 for the 7x7 local crop
+    env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
 
     # 5. Network Instantiation
     seer = Seer(fsq_levels=config["fsq_levels"])
@@ -125,7 +120,7 @@ def main():
         rng, rollout_rng = jax.random.split(rng)
         
         # Curriculums
-        vision_radius = jnp.clip(2.0 - 2.0 * (update / 1000.0), 0.0, 2.0)
+        vision_radius = jnp.clip(3.0 - 2.0 * (update / 1000.0), 1.0, 3.0)
         seer_entropy_coef = jnp.clip(0.1 - 0.09 * (update / 1000.0), 0.01, 0.1)
         
         # A. Collect Trajectory
