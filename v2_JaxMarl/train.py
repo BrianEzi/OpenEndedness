@@ -36,15 +36,12 @@ def main():
     # 1. Configuration and Logging
     config = {
         "learning_rate": 3e-4,
-        "num_envs": 1, # Kept at 1 for initial debugging, scale up later
+        "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 1_000_000,
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
         "seed": 42
     }
-
-    if config["num_envs"] != 1:
-        raise ValueError("This training loop currently supports exactly one environment.")
     
     # wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
     
@@ -62,8 +59,9 @@ def main():
 
     # 4. Initial Environment Reset
     rng, env_rng = jax.random.split(rng, 2)
+    reset_keys = jax.random.split(env_rng, config["num_envs"])
     # Give initial full vision radius of 2.0
-    env_obs, env_state = env.reset(env_rng, vision_radius=jnp.array(2.0))
+    env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(2.0))
 
     # 5. Network Instantiation
     seer = Seer(fsq_levels=config["fsq_levels"])
@@ -72,18 +70,21 @@ def main():
 
     # 6. Parameter Initialization (Dummy Forward Passes)
     # We must pass data of the correct shape to initialize the Flax parameters
-    dummy_map = env_obs["global_map"][None, ...]
-    dummy_sym = env_obs["symbolic_state"][None, ...]
-    dummy_local = env_obs["local_view"][None, ...]
-    dummy_prop = env_obs["proprioception"][None, ...]
+    dummy_map = env_obs["global_map"][:1]
+    dummy_sym = env_obs["symbolic_state"][:1]
+    dummy_local = env_obs["local_view"][:1]
+    dummy_prop = env_obs["proprioception"][:1]
     dummy_msg = jnp.zeros((1, len(config["fsq_levels"])))
     
-    seer_carry = seer.initialize_carry(1, 128)
-    doer_carry = doer.initialize_carry(1, 128)
+    init_seer_carry = seer.initialize_carry(1, 128)
+    init_doer_carry = doer.initialize_carry(1, 128)
 
-    seer_params = seer.init(seer_init_rng, seer_carry, dummy_map, dummy_sym)["params"]
-    doer_params = doer.init(doer_init_rng, doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
+    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
     critic_params = critic.init(critic_init_rng, dummy_map)["params"]
+
+    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+    doer_carry = doer.initialize_carry(config["num_envs"], 128)
 
     # Group parameters for the execution loop
     params = {"seer": seer_params, "doer": doer_params, "critic": critic_params}
@@ -141,9 +142,10 @@ def main():
         # C. Update Networks
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
         
-        # Add a batch dimension to trajectories
-        batched_trajectory = jax.tree_util.tree_map(lambda x: x[None, ...], trajectory_batch)
-        # Carries already have the batch dimension from initialize_carry()
+        batched_trajectory = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1),
+            trajectory_batch
+        )
         batched_seer_carry = init_seer_carry
         batched_doer_carry = init_doer_carry
 
@@ -203,8 +205,8 @@ def main():
             m = np.rint(np.array(trajectory_batch.message)).astype(np.int32)
             m = np.clip(m, 0, levels - 1)
             a = np.array(trajectory_batch.action)
-            m_flat = (m * multipliers).sum(axis=-1).astype(np.int32)
-            a_flat = a.astype(np.int32)
+            m_flat = (m * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
+            a_flat = a.astype(np.int32).reshape(-1)
             
             num_actions = env.num_actions
             num_message_codes = int(np.prod(levels))

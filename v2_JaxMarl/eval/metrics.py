@@ -29,17 +29,20 @@ def compute_cic(
         )
         return next_doer_carry, logits
 
-    # Transition batch shapes: (seq_len, ...) from loop.py
-    # We add batch dim of 1 for the network inputs
-    loc = transition_batch.local_obs[:, None, ...]
-    prop = transition_batch.proprioception[:, None, ...]
-    msg_true = transition_batch.message[:, None, ...]
+    # Transition batch shapes: (seq_len, num_envs, ...) from loop.py
+    loc = transition_batch.local_obs
+    prop = transition_batch.proprioception
+    msg_true = transition_batch.message
 
     # True forward pass
     _, true_logits = jax.lax.scan(scan_fn, init_doer_carry, (msg_true, loc, prop))
     
-    # Ablated forward pass (shuffle messages over time)
-    msg_shuffled = jax.random.permutation(rng, msg_true, independent=True)
+    # Ablated forward pass: shuffle messages independently over time for each env.
+    env_keys = jax.random.split(rng, msg_true.shape[1])
+    msg_shuffled = jax.vmap(
+        lambda key, msgs: jax.random.permutation(key, msgs, axis=0)
+    )(env_keys, jnp.swapaxes(msg_true, 0, 1))
+    msg_shuffled = jnp.swapaxes(msg_shuffled, 0, 1)
     
     _, ablated_logits = jax.lax.scan(scan_fn, init_doer_carry, (msg_shuffled, loc, prop))
     

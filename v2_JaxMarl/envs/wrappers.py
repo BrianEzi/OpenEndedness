@@ -68,6 +68,14 @@ class AsymmetricOvercookedWrapper:
         asymmetric_obs = self._split_observations(state, raw_obs, vision_radius)
         return asymmetric_obs, state
 
+    def reset_batch(
+        self,
+        keys: jnp.ndarray,
+        vision_radius: jnp.ndarray = jnp.array(2.0)
+    ) -> Tuple[Dict[str, Any], Any]:
+        """Vectorized reset across a batch of environment keys."""
+        return jax.vmap(self.reset, in_axes=(0, None))(keys, vision_radius)
+
     def step(
         self, 
         key: jnp.ndarray, 
@@ -110,3 +118,13 @@ class AsymmetricOvercookedWrapper:
         shared_done = dones['__all__']
         
         return asymmetric_obs, next_state, shared_reward, shared_done, info
+
+    def step_batch(
+        self,
+        keys: jnp.ndarray,
+        states: Any,
+        doer_actions: jnp.ndarray,
+        vision_radius: jnp.ndarray = jnp.array(2.0)
+    ) -> Tuple[Dict[str, Any], Any, jnp.ndarray, jnp.ndarray, Dict]:
+        """Vectorized step across a batch of environment states and actions."""
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, doer_actions, vision_radius)
