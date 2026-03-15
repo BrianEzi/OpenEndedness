@@ -38,7 +38,7 @@ def main():
         "num_steps": 128,
         "total_timesteps": 1_000_000,
         "env_id": "Navix-Empty-Random-8x8-v0",
-        "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
+        "fsq_levels": [2] * 8, # Defines the categorical hypercube
         "seed": 42,
         "progress_reward_scale": 0.1,
         "cic_coef": 0.01,
@@ -190,7 +190,15 @@ def main():
             #     "vision_radius": vision_radius,
             #     "seer_entropy_coef": seer_entropy_coef
             # })
-            print(f"Update {update}/{num_updates} | Reward: {trajectory_batch.reward.mean():.3f} | Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f}")
+            rng, cic_rng = jax.random.split(rng)
+            cic_score = compute_cic(
+                doer.apply,
+                params["doer"],
+                trajectory_batch,
+                init_doer_carry,
+                cic_rng
+            )
+            print(f"Update {update}/{num_updates} | Reward: {trajectory_batch.reward.mean():.3f} | Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | CIC: {cic_score:.3f}")
             
             # Log a small sample of the discrete messages to see distribution
             sample_msgs = actor_metrics.get("discrete_messages")
@@ -201,14 +209,7 @@ def main():
 
         # E. Causal Influence of Communication and Heatmap logging
         if update % 50 == 0:
-            rng, cic_rng = jax.random.split(rng)
-            cic_score = compute_cic(
-                doer.apply,
-                params["doer"],
-                trajectory_batch,
-                init_doer_carry,
-                cic_rng
-            )
+
             
             # Compute Heatmap
             levels = np.array(config["fsq_levels"], dtype=np.int32)
@@ -249,7 +250,7 @@ def main():
             #     "Signal_Action_Heatmap": heatmap_log
             # }, commit=False)
             
-            print(f"CIC Score: {cic_score:.4f}")
+            
 
         if update % config["visualize_every"] == 0:
             rng, viz_rng = jax.random.split(rng)

@@ -104,6 +104,7 @@ class NavixGridWrapper:
             reward = jnp.asarray(0.0, dtype=jnp.float32)
             done = jnp.asarray(False)
             info = {
+                "return": reset_timestep.info.get("return", reward),
                 "task_reward": reward,
                 "progress_reward": reward,
                 "goal_distance": self._goal_distance(reset_timestep.state),

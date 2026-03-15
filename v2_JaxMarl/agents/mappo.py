@@ -198,7 +198,7 @@ def update_actor(
             # Record explicit gradient norms for auditing
             seer_grad_norm = optax.global_norm(grads["seer"])
             doer_grad_norm = optax.global_norm(grads["doer"])
-            jax.debug.print("Seer Grad Norm: {norm}", norm=seer_grad_norm)
+            # jax.debug.print("Seer Grad Norm: {norm}", norm=seer_grad_norm)
             
             metrics["seer_grad_norm"] = seer_grad_norm
             metrics["doer_grad_norm"] = doer_grad_norm
