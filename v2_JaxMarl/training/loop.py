@@ -111,7 +111,7 @@ import functools
 
 @functools.partial(jax.jit, static_argnames=("num_steps", "step_fn", "critic_apply_fn", "doer_apply_fn"))
 def generate_trajectory_and_gae(
-    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, num_steps: int,
+    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
     step_fn, critic_apply_fn, doer_apply_fn
 ):
     """
@@ -147,8 +147,7 @@ def generate_trajectory_and_gae(
         cic_rng
     )
     
-    w_cic = 0.1
-    reward_with_cic = trajectory_batch.reward + w_cic * cic_score
+    reward_with_cic = trajectory_batch.reward + cic_coef * cic_score
     
     # 5. Compute GAE
     # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 

@@ -7,8 +7,9 @@ from navix import observations
 class NavixGridWrapper:
     """Expose Navix single-agent environments with the Seer/Doer observation split."""
 
-    def __init__(self, env):
+    def __init__(self, env, progress_reward_scale: float = 0.1):
         self._env = env
+        self.progress_reward_scale = progress_reward_scale
 
     @property
     def num_actions(self) -> int:
@@ -33,14 +34,8 @@ class NavixGridWrapper:
             dtype=jnp.float32,
         )
 
-        # Navix first-person view is centered around the agent; curriculum masks by radius.
-        height, width = local_view.shape[:2]
-        center_y = height // 2
-        center_x = width // 2
-        yy, xx = jnp.meshgrid(jnp.arange(height), jnp.arange(width), indexing="ij")
-        dist = jnp.maximum(jnp.abs(xx - center_x), jnp.abs(yy - center_y))
-        mask = (dist <= vision_radius)[..., None]
-        local_view = jnp.where(mask, local_view, 0)
+        # The Doer is fully blind: no visual grid is exposed at all.
+        local_view = jnp.zeros_like(local_view)
 
         proprioception = jnp.array(
             [
@@ -59,6 +54,12 @@ class NavixGridWrapper:
             "proprioception": proprioception,
         }
 
+    @staticmethod
+    def _goal_distance(state) -> jnp.ndarray:
+        player = state.get_player()
+        goal = state.get_goals()
+        return jnp.abs(player.position - goal.position[0]).sum().astype(jnp.float32)
+
     def reset(self, key: jnp.ndarray, vision_radius: jnp.ndarray = jnp.array(3.0)):
         timestep = self._env.reset(key)
         obs = self._split_observations(timestep, vision_radius)
@@ -75,11 +76,19 @@ class NavixGridWrapper:
         vision_radius: jnp.ndarray = jnp.array(3.0),
     ):
         del key  # Navix carries the RNG inside the timestep state.
+        old_distance = self._goal_distance(timestep.state)
         next_timestep = self._env.step(timestep, action)
+        new_distance = self._goal_distance(next_timestep.state)
         obs = self._split_observations(next_timestep, vision_radius)
-        reward = next_timestep.reward
+        task_reward = next_timestep.reward.astype(jnp.float32)
+        progress_reward = (old_distance - new_distance) * self.progress_reward_scale
+        reward = task_reward + progress_reward
         done = next_timestep.is_done()
-        return obs, next_timestep, reward, done, next_timestep.info
+        info = dict(next_timestep.info)
+        info["task_reward"] = task_reward
+        info["progress_reward"] = progress_reward
+        info["goal_distance"] = new_distance
+        return obs, next_timestep, reward, done, info
 
     def step_batch(
         self,

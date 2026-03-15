@@ -40,6 +40,8 @@ def main():
         "env_id": "Navix-Empty-Random-6x6-v0",
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
         "seed": 42,
+        "progress_reward_scale": 0.1,
+        "cic_coef": 0.01,
         "visualize_every": 50,
         "visualize_max_steps": 200,
         "visualize_dir": "artifacts/episodes",
@@ -54,7 +56,7 @@ def main():
 
     # 3. Environment Instantiation
     raw_env = nx.make(config["env_id"])
-    env = NavixGridWrapper(raw_env)
+    env = NavixGridWrapper(raw_env, progress_reward_scale=config["progress_reward_scale"])
 
     # 4. Initial Environment Reset
     rng, env_rng = jax.random.split(rng, 2)
@@ -128,7 +130,15 @@ def main():
         init_doer_carry = doer_carry
         
         final_runner_state, trajectory_batch = generate_trajectory_and_gae(
-            params, rollout_rng, env_obs, env_state, seer_carry, doer_carry, vision_radius, config["num_steps"],
+            params,
+            rollout_rng,
+            env_obs,
+            env_state,
+            seer_carry,
+            doer_carry,
+            vision_radius,
+            jnp.array(config["cic_coef"], dtype=jnp.float32),
+            config["num_steps"],
             step_fn, critic.apply, doer.apply
         )
         
