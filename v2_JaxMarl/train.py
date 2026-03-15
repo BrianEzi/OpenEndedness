@@ -37,7 +37,7 @@ def main():
         "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 1_000_000,
-        "env_id": "Navix-Empty-Random-6x6-v0",
+        "env_id": "Navix-Empty-8x8-v0",
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
         "seed": 42,
         "progress_reward_scale": 0.1,
