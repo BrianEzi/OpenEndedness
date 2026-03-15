@@ -43,6 +43,7 @@ def main():
         "progress_reward_scale": 0.1,
         "cic_coef": 0.01,
         "min_start_distance": 6.0,
+        "step_penalty": 0.01,
         "visualize_every": 50,
         "visualize_max_steps": 200,
         "visualize_dir": "artifacts/episodes",
@@ -61,6 +62,7 @@ def main():
         raw_env,
         progress_reward_scale=config["progress_reward_scale"],
         min_start_distance=config["min_start_distance"],
+        step_penalty=config["step_penalty"],
     )
 
     # 4. Initial Environment Reset

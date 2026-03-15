@@ -12,10 +12,12 @@ class NavixGridWrapper:
         env,
         progress_reward_scale: float = 0.1,
         min_start_distance: float = 0.0,
+        step_penalty: float = 0.0,
     ):
         self._env = env
         self.progress_reward_scale = progress_reward_scale
         self.min_start_distance = jnp.asarray(min_start_distance, dtype=jnp.float32)
+        self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
 
     @property
     def num_actions(self) -> int:
@@ -107,6 +109,7 @@ class NavixGridWrapper:
                 "return": reset_timestep.info.get("return", reward),
                 "task_reward": reward,
                 "progress_reward": reward,
+                "step_penalty": reward,
                 "goal_distance": self._goal_distance(reset_timestep.state),
             }
             return reset_obs, reset_timestep, reward, done, info
@@ -118,11 +121,13 @@ class NavixGridWrapper:
             obs = self._split_observations(next_timestep, vision_radius)
             task_reward = next_timestep.reward.astype(jnp.float32)
             progress_reward = (old_distance - new_distance) * self.progress_reward_scale
-            reward = task_reward + progress_reward
+            step_penalty = self.step_penalty
+            reward = task_reward + progress_reward - step_penalty
             done = next_timestep.is_done()
             info = dict(next_timestep.info)
             info["task_reward"] = task_reward
             info["progress_reward"] = progress_reward
+            info["step_penalty"] = step_penalty
             info["goal_distance"] = new_distance
             return obs, next_timestep, reward, done, info
 
