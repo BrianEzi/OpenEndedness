@@ -1,57 +1,83 @@
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 from PIL import Image
-import numpy as np
 
-def visualize_episode(env, params, rng, seer_apply_fn, doer_apply_fn, filename="episode.gif"):
-    """Runs one episode and saves the rendering to a GIF."""
+
+def visualize_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    filename="episode.gif",
+    vision_radius=jnp.array(2.0),
+    max_steps=200,
+):
+    """Run one greedy evaluation episode and save it as a GIF."""
     frames = []
-    
-    # Initialize env and state
+    output_path = Path(filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     rng, reset_rng = jax.random.split(rng)
-    obs, state = env.reset(reset_rng)
-    
-    # Initialize LSTM carries 
-    seer_carry = seer_apply_fn.initialize_carry(batch_size=1, hidden_size=128)
-    doer_carry = doer_apply_fn.initialize_carry(batch_size=1, hidden_size=128)
-    
+    obs, state = env.reset(reset_rng, vision_radius=vision_radius)
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+
     done = False
     step_count = 0
-    
-    while not done and step_count < 200:
-        # Render the current state
-        # jaxmarl render usually returns a numpy array (RGB)
+
+    while not bool(done) and step_count < max_steps:
         frame = env.render(state)
         frames.append(Image.fromarray(frame))
-        
-        # 1. Seer generates message based on Global Map [cite: 80, 132]
-        seer_carry, message, _ = seer_apply_fn(
-            {"params": params["seer"]}, 
-            seer_carry, 
-            obs["global_map"], 
-            obs["symbolic_state"]
+
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_view = obs["local_view"][None, ...]
+        proprioception = obs["proprioception"][None, ...]
+
+        seer_carry, message, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
         )
-        
-        # 2. Doer takes action based on message and local/blind view [cite: 82, 138]
-        doer_carry, action_logits = doer_apply_fn(
-            {"params": params["doer"]}, 
-            doer_carry, 
-            obs["local_view"], 
-            obs["proprioception"], 
-            message
+
+        doer_carry, action_logits = doer.apply(
+            {"params": params["doer"]},
+            doer_carry,
+            local_view,
+            proprioception,
+            message,
         )
-        
-        # Select action (Greedy for visualization)
-        action = jnp.argmax(action_logits, axis=-1)
-        
-        # 3. Step Environment
+
+        action = jnp.argmax(action_logits[0]).astype(jnp.int32)
+
         rng, step_rng = jax.random.split(rng)
-        obs, state, reward, done, _ = env.step(step_rng, state, action)
-        
-        # Print logs to see communication in real-time
-        print(f"Step {step_count} | Message: {message} | Action: {action} | Reward: {reward}")
+        obs, state, reward, done, _ = env.step(
+            step_rng,
+            state,
+            action,
+            vision_radius=vision_radius,
+        )
+
+        print(
+            f"Viz step {step_count} | Message: {message[0]} | "
+            f"Action: {int(action)} | Reward: {float(reward):.3f}"
+        )
         step_count += 1
 
-    # Save animation
-    frames[0].save(filename, save_all=True, append_images=frames[1:], duration=100, loop=0)
-    print(f"Episode saved to {filename}")
+    if not frames:
+        raise RuntimeError("Visualization episode produced no frames.")
+
+    frames[0].save(
+        output_path,
+        save_all=True,
+        append_images=frames[1:],
+        duration=120,
+        loop=0,
+    )
+    print(f"Episode saved to {output_path}")
+    return output_path

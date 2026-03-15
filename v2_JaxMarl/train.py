@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import optax
+from pathlib import Path
 # import wandb
 import flax.linen as nn
 from flax.training.train_state import TrainState
@@ -40,7 +41,10 @@ def main():
         "num_steps": 128,
         "total_timesteps": 1_000_000,
         "fsq_levels": [5, 5, 5], # Defines the categorical hypercube
-        "seed": 42
+        "seed": 42,
+        "visualize_every": 50,
+        "visualize_max_steps": 200,
+        "visualize_dir": "artifacts/episodes",
     }
     
     # wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
@@ -236,6 +240,20 @@ def main():
             # }, commit=False)
             
             print(f"CIC Score: {cic_score:.4f}")
+
+        if update % config["visualize_every"] == 0:
+            rng, viz_rng = jax.random.split(rng)
+            viz_path = Path(config["visualize_dir"]) / f"episode_{update:05d}.gif"
+            visualize_episode(
+                env,
+                params,
+                viz_rng,
+                seer,
+                doer,
+                filename=str(viz_path),
+                vision_radius=vision_radius,
+                max_steps=config["visualize_max_steps"],
+            )
 
 if __name__ == "__main__":
     main()

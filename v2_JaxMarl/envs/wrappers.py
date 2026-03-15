@@ -1,6 +1,8 @@
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing import Tuple, Dict, Any
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 
 class AsymmetricOvercookedWrapper:
     """
@@ -9,6 +11,7 @@ class AsymmetricOvercookedWrapper:
     """
     def __init__(self, env):
         self._env = env
+        self._visualizer = OvercookedVisualizer()
         # In standard jaxmarl Overcooked, agents are usually 'agent_0' and 'agent_1'
         self.seer_id = 'agent_0'
         self.doer_id = 'agent_1'
@@ -128,3 +131,15 @@ class AsymmetricOvercookedWrapper:
     ) -> Tuple[Dict[str, Any], Any, jnp.ndarray, jnp.ndarray, Dict]:
         """Vectorized step across a batch of environment states and actions."""
         return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, doer_actions, vision_radius)
+
+    def render(self, state: Any) -> np.ndarray:
+        """Render a single environment state to an RGB frame."""
+        padding = self._env.agent_view_size - 2
+        grid = np.asarray(state.maze_map[padding:-padding, padding:-padding, :])
+        return OvercookedVisualizer._render_grid(
+            grid,
+            tile_size=32,
+            highlight_mask=None,
+            agent_dir_idx=np.asarray(state.agent_dir_idx),
+            agent_inv=np.asarray(state.agent_inv),
+        )
