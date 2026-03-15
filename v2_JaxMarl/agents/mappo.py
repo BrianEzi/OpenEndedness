@@ -33,7 +33,6 @@ def calculate_actor_loss(
     transition_batch: Transition,
     init_seer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
     init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
-    fsq_rng: jnp.ndarray, # Added fsq_rng
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01)
@@ -45,18 +44,12 @@ def calculate_actor_loss(
     # Wait, loop.py returns (num_steps, ...) for single env. Let's assume unbatched or reshape-able.
     # If the user is unrolling over dimension 0:
     
-    # Split the PRNG key for the sequence dimension
-    # transition_batch is (seq_len, batch_size, ...) after swapaxes in update_actor
-    seq_len = transition_batch.global_obs.shape[0]
-    scan_rngs = jax.random.split(fsq_rng, seq_len)
-    
-    def scan_fn(carry, inputs):
+    def scan_fn(carry, transition_step):
         # Step shape assertions:
         # chex.assert_rank(transition_step.action, 1) # (batch_size,)
         # chex.assert_rank(transition_step.global_obs, 4) # (batch_size, H, W, C)
         
         seer_carry, doer_carry = carry
-        transition_step, step_rng = inputs # Unpack inputs
         
         # Seer Forward Pass
         next_seer_carry, discrete_message, thought_vector = seer_apply_fn(
@@ -64,7 +57,6 @@ def calculate_actor_loss(
             seer_carry,
             transition_step.global_obs,
             transition_step.symbolic_obs,
-            rngs={"noise": step_rng} # Added rngs for noise
         )
         
         # Doer Forward Pass
@@ -80,7 +72,7 @@ def calculate_actor_loss(
     _, (logits, discrete_messages, thought_vectors) = jax.lax.scan(
         scan_fn, 
         (init_seer_carry, init_doer_carry), 
-        (transition_batch, scan_rngs) # Pass scan_rngs as part of xs
+        transition_batch
     )
     
     # Create a distribution object
@@ -184,23 +176,21 @@ def update_actor(
         def minibatch_fn(state, start_idx):
             # Slice the minibatch
             indices = jax.lax.dynamic_slice_in_dim(permutation, start_idx, minibatch_size)
-            mb_transition = jax.tree_map(lambda x: x[indices], transition_batch)
+            mb_transition = jax.tree_util.tree_map(lambda x: x[indices], transition_batch)
             
             # Since calculate_actor_loss currently assumes scan over time, and time is dim 1:
             # wait, if input is (batch, time, ...) and scan is over time, we must swap axes!
             # scan_fn expects transition sequence to be the leading dimension.
             # So let's swap seq_len (dim 1) to be dim 0 for scan.
-            mb_transition_time_first = jax.tree_map(lambda x: jnp.swapaxes(x, 0, 1), mb_transition)
+            mb_transition_time_first = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), mb_transition)
             
             # Extract initial carries for this minibatch
             # Assuming init_seer_carry is (batch_size, ...)
-            mb_seer_carry = jax.tree_map(lambda x: x[indices], init_seer_carry)
-            mb_doer_carry = jax.tree_map(lambda x: x[indices], init_doer_carry)
-            
-            rng_mb, fsq_rng = jax.random.split(key) # Split key for fsq_rng
+            mb_seer_carry = jax.tree_util.tree_map(lambda x: x[indices], init_seer_carry)
+            mb_doer_carry = jax.tree_util.tree_map(lambda x: x[indices], init_doer_carry)
             
             loss_fn = lambda params: calculate_actor_loss(
-                seer_apply_fn, doer_apply_fn, params, mb_transition_time_first, mb_seer_carry, mb_doer_carry, fsq_rng, seer_entropy_coef=seer_entropy_coef
+                seer_apply_fn, doer_apply_fn, params, mb_transition_time_first, mb_seer_carry, mb_doer_carry, seer_entropy_coef=seer_entropy_coef
             )
             
             (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
@@ -245,7 +235,7 @@ def update_critic(
     
     # For critic we can flatten the batch and sequence dimension since it's just MLPs
     batch_size = transition_batch.action.shape[0] * transition_batch.action.shape[1]
-    flat_transition = jax.tree_map(lambda x: x.reshape((batch_size,) + x.shape[2:]), transition_batch)
+    flat_transition = jax.tree_util.tree_map(lambda x: x.reshape((batch_size,) + x.shape[2:]), transition_batch)
     minibatch_size = batch_size // num_minibatches
     
     def epoch_fn(carry, _):
@@ -255,7 +245,7 @@ def update_critic(
         
         def minibatch_fn(state, start_idx):
             indices = jax.lax.dynamic_slice_in_dim(permutation, start_idx, minibatch_size)
-            mb_transition = jax.tree_map(lambda x: x[indices], flat_transition)
+            mb_transition = jax.tree_util.tree_map(lambda x: x[indices], flat_transition)
             
             loss_fn = lambda params: calculate_critic_loss(
                 critic_apply_fn, params, mb_transition
@@ -268,12 +258,12 @@ def update_critic(
         start_indices = jnp.arange(0, batch_size, minibatch_size)
         critic_state, mb_metrics = jax.lax.scan(minibatch_fn, critic_state, start_indices)
         
-        epoch_metrics = jax.tree_map(lambda x: x.mean(), mb_metrics)
+        epoch_metrics = jax.tree_util.tree_map(lambda x: x.mean(), mb_metrics)
         return (critic_state, key), epoch_metrics
 
     (final_critic_state, _), epoch_metrics = jax.lax.scan(
         epoch_fn, (critic_state, rng), None, length=num_ppo_epochs
     )
     
-    final_metrics = jax.tree_map(lambda x: x.mean(), epoch_metrics)
+    final_metrics = jax.tree_util.tree_map(lambda x: x.mean(), epoch_metrics)
     return final_critic_state, final_metrics
