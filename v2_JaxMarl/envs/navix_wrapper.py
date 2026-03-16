@@ -13,23 +13,53 @@ class NavixGridWrapper:
         progress_reward_scale: float = 0.1,
         min_start_distance: float = 0.0,
         step_penalty: float = 0.0,
+        bump_penalty: float = 0.1,
     ):
         self._env = env
         self.progress_reward_scale = progress_reward_scale
         self.min_start_distance = jnp.asarray(min_start_distance, dtype=jnp.float32)
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
+        self.bump_penalty = jnp.asarray(bump_penalty, dtype=jnp.float32)
 
     @property
     def num_actions(self) -> int:
         return int(self._env.action_space.n)
 
+    @staticmethod
+    def _direction_delta(direction: jnp.ndarray) -> jnp.ndarray:
+        # Navix follows the MiniGrid convention: right, down, left, up.
+        deltas = jnp.array(
+            [
+                [0, 1],
+                [1, 0],
+                [0, -1],
+                [-1, 0],
+            ],
+            dtype=jnp.int32,
+        )
+        return deltas[direction.astype(jnp.int32)]
+
     def _split_observations(self, timestep, vision_radius: jnp.ndarray):
         state = timestep.state
         global_map = observations.symbolic(state).astype(jnp.float32)
-        local_view = observations.symbolic_first_person(state).astype(jnp.float32)
 
         player = state.get_player()
         goal = state.get_goals()
+        direction_delta = self._direction_delta(player.direction)
+        grid_shape = jnp.asarray(global_map.shape[:2], dtype=jnp.int32)
+        front_position = jnp.clip(
+            player.position + direction_delta,
+            0,
+            grid_shape - 1,
+        )
+        current_cell = global_map[player.position[0], player.position[1]]
+        front_cell = global_map[front_position[0], front_position[1]]
+
+        # The Doer only sees its own tile plus the tile directly in front.
+        local_view = jnp.zeros((3, 3, global_map.shape[-1]), dtype=jnp.float32)
+        local_view = local_view.at[1, 1].set(current_cell)
+        local_view = local_view.at[0, 1].set(front_cell)
+
         symbolic_state = jnp.array(
             [
                 player.position[0],
@@ -41,9 +71,6 @@ class NavixGridWrapper:
             ],
             dtype=jnp.float32,
         )
-
-        # The Doer is fully blind: no visual grid is exposed at all.
-        local_view = jnp.zeros_like(local_view)
 
         proprioception = jnp.array(
             [
@@ -110,24 +137,37 @@ class NavixGridWrapper:
                 "task_reward": reward,
                 "progress_reward": reward,
                 "step_penalty": reward,
+                "bump_penalty": reward,
                 "goal_distance": self._goal_distance(reset_timestep.state),
             }
             return reset_obs, reset_timestep, reward, done, info
 
         def step_branch(_):
             old_distance = self._goal_distance(timestep.state)
+            old_position = timestep.state.get_player().position
             next_timestep = self._env.step(timestep, action)
             new_distance = self._goal_distance(next_timestep.state)
+            new_position = next_timestep.state.get_player().position
             obs = self._split_observations(next_timestep, vision_radius)
             task_reward = next_timestep.reward.astype(jnp.float32)
             progress_reward = (old_distance - new_distance) * self.progress_reward_scale
             step_penalty = self.step_penalty
-            reward = task_reward + progress_reward - step_penalty
+            bumped = jnp.logical_and(
+                action == 2,
+                jnp.all(new_position == old_position),
+            )
+            bump_penalty = jnp.where(
+                bumped,
+                self.bump_penalty,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+            reward = task_reward + progress_reward - step_penalty - bump_penalty
             done = next_timestep.is_done()
             info = dict(next_timestep.info)
             info["task_reward"] = task_reward
             info["progress_reward"] = progress_reward
             info["step_penalty"] = step_penalty
+            info["bump_penalty"] = bump_penalty
             info["goal_distance"] = new_distance
             return obs, next_timestep, reward, done, info
 

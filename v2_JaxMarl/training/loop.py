@@ -8,12 +8,21 @@ from training.gae import compute_gae
 from agents.mappo import Transition 
 from eval.metrics import compute_cic
 
-def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
+def make_rollout_step(
+    env,
+    seer_apply_fn,
+    doer_apply_fn,
+    critic_apply_fn,
+    train_epsilon=0.1,
+    follow_reward_scale=0.1,
+):
     """
     A closure that returns the JAX-compilable step function.
     Passing the environment and apply functions here avoids passing them 
     repeatedly into the compiled loop.
     """
+    train_epsilon = jnp.asarray(train_epsilon, dtype=jnp.float32)
+    follow_reward_scale = jnp.asarray(follow_reward_scale, dtype=jnp.float32)
     
     def rollout_step(runner_state: Tuple, _):
         """
@@ -25,7 +34,7 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         num_envs = env_obs["global_map"].shape[0]
         
         # Split the PRNG key for the stochastic actions
-        rng, doer_rng, env_rng = jax.random.split(rng, 3)
+        rng, doer_rng, eps_rng, env_rng = jax.random.split(rng, 4)
         env_step_keys = jax.random.split(env_rng, num_envs)
         
         # 1. Seer Forward Pass (Prefrontal Cortex)
@@ -53,15 +62,42 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
             proprioception, 
             discrete_message
         )
+        _, null_action_logits = doer_apply_fn(
+            {"params": params["doer"]},
+            doer_carry,
+            local_obs,
+            proprioception,
+            jnp.zeros_like(discrete_message),
+        )
         
-        # 3. Action Selection via Distrax
+        # 3. Action Selection
         pi = distrax.Categorical(logits=action_logits)
-        action = pi.sample(seed=doer_rng)
-        log_prob = pi.log_prob(action)
+        null_pi = distrax.Categorical(logits=null_action_logits)
+        greedy_action = jnp.argmax(action_logits, axis=-1).astype(jnp.int32)
+        random_action = jax.random.randint(
+            doer_rng,
+            shape=(num_envs,),
+            minval=0,
+            maxval=action_logits.shape[-1],
+            dtype=jnp.int32,
+        )
+        take_random = jax.random.uniform(eps_rng, shape=(num_envs,)) < train_epsilon
+        action = jnp.where(take_random, random_action, greedy_action)
+
+        # Store the behavior-policy log-prob for PPO ratio calculation.
+        num_actions = jnp.asarray(action_logits.shape[-1], dtype=jnp.float32)
+        uniform_prob = train_epsilon / num_actions
+        greedy_prob = (1.0 - train_epsilon) + uniform_prob
+        behavior_prob = jnp.where(action == greedy_action, greedy_prob, uniform_prob)
+        log_prob = jnp.log(jnp.clip(behavior_prob, a_min=1e-8))
+        follow_reward = jnp.maximum(
+            pi.log_prob(action) - null_pi.log_prob(action),
+            0.0,
+        ) * follow_reward_scale
         
         # 4. Critic Forward Pass (Centralized Training)
         # The critic evaluates the global state to guide learning[cite: 111].
-        value = critic_apply_fn({"params": params["critic"]}, global_map).squeeze(-1)
+        value = critic_apply_fn({"params": params["critic"]}, global_map)
         
         # 5. Environment Step
         # Step the jaxmarl environment using the chosen action
@@ -70,6 +106,14 @@ def make_rollout_step(env, seer_apply_fn, doer_apply_fn, critic_apply_fn):
         next_env_obs, next_env_state, reward, done, info = env.step_batch(
             env_step_keys, env_state, action, vision_radius=vision_radius
         )
+
+        task_reward = info["task_reward"]
+        progress_reward = info["progress_reward"]
+        step_penalty = info["step_penalty"]
+        bump_penalty = info["bump_penalty"]
+        seer_reward = task_reward + progress_reward - step_penalty
+        doer_reward = task_reward + follow_reward - step_penalty - bump_penalty
+        reward = jnp.stack([seer_reward, doer_reward], axis=-1)
 
         done_mask = done[:, None]
         next_seer_carry = jax.tree_util.tree_map(
@@ -135,7 +179,7 @@ def generate_trajectory_and_gae(
     
     # 3. Calculate the bootstrap value (last_val)
     # The critic evaluates the state *after* the final step
-    last_val = critic_apply_fn({"params": params["critic"]}, final_global_map).squeeze(-1)
+    last_val = critic_apply_fn({"params": params["critic"]}, final_global_map)
     
     # 4. Compute CIC and Intrinsic Reward
     rng, cic_rng = jax.random.split(rng)
@@ -147,16 +191,20 @@ def generate_trajectory_and_gae(
         cic_rng
     )
     
-    reward_with_cic = trajectory_batch.reward + cic_coef * cic_score
+    reward_with_cic = trajectory_batch.reward.at[..., 1].add(cic_coef * cic_score)
     
     # 5. Compute GAE
     # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 
     # compute_gae with jax.vmap(compute_gae, in_axes=1, out_axes=1) to vectorize 
     # the advantage calculation across all environments simultaneously.
     advantages, returns = jax.vmap(
-        compute_gae,
-        in_axes=(1, 1, 1, 0, None, None),
-        out_axes=1,
+        jax.vmap(
+            compute_gae,
+            in_axes=(1, 1, 1, 0, None, None),
+            out_axes=1,
+        ),
+        in_axes=(2, 2, None, 1, None, None),
+        out_axes=2,
     )(
         reward_with_cic,
         trajectory_batch.value,

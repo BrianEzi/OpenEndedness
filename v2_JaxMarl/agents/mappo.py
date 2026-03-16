@@ -26,7 +26,7 @@ class Transition:
     return_val: chex.Array
 
 # 2. Loss Functions: Separated from network definitions
-def calculate_actor_loss(
+def calculate_actor_losses(
     seer_apply_fn: Callable,
     doer_apply_fn: Callable,
     actor_params: dict, # Changed from Any to dict
@@ -37,7 +37,7 @@ def calculate_actor_loss(
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01)
 ) -> Tuple[jnp.ndarray, dict]:
-    """Calculates the PPO clipped surrogate loss using distrax and scan over sequence."""
+    """Calculates separate PPO losses for the Seer and Doer reward streams."""
     
     # We must assert shape to prevent silent broadcasting bugs.
     # transition_batch has shape (batch_size, sequence_length, ...) or just (sequence_length, ...)
@@ -75,41 +75,34 @@ def calculate_actor_loss(
         transition_batch
     )
     
-    # Create a distribution object
-    # For discrete communication/actions, Categorical is the standard
     pi = distrax.Categorical(logits=logits)
-    
-    # Use the distribution to get new log_probs and entropy
-    # transition_batch.action contains the indices of the symbols sent
     new_log_probs = pi.log_prob(transition_batch.action)
     entropy = pi.entropy().mean()
-    
-    # Calculate the ratio (pi_new / pi_old)
     logratio = new_log_probs - transition_batch.log_prob
     ratio = jnp.exp(logratio)
-    
-    # Advantage normalization
-    adv = transition_batch.advantage
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    
-    # Standard PPO Clipped Objective
-    loss_unclipped = ratio * adv
-    loss_clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
-    
-    actor_loss = -jnp.minimum(loss_unclipped, loss_clipped).mean()
-    entropy_loss = entropy_coef * entropy
-    
+
+    seer_adv = transition_batch.advantage[..., 0]
+    doer_adv = transition_batch.advantage[..., 1]
+    seer_adv = (seer_adv - seer_adv.mean()) / (seer_adv.std() + 1e-8)
+    doer_adv = (doer_adv - doer_adv.mean()) / (doer_adv.std() + 1e-8)
+
+    seer_loss_unclipped = ratio * seer_adv
+    seer_loss_clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * seer_adv
+    seer_actor_loss = -jnp.minimum(seer_loss_unclipped, seer_loss_clipped).mean()
+
+    doer_loss_unclipped = ratio * doer_adv
+    doer_loss_clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * doer_adv
+    doer_actor_loss = -jnp.minimum(doer_loss_unclipped, doer_loss_clipped).mean()
+
     # Calculate aux metrics for information bottleneck auditing
     thought_variance = jnp.var(thought_vectors, axis=0).mean()
-    
-    seer_entropy_bonus = seer_entropy_coef * thought_variance
-    
-    total_actor_loss = actor_loss - entropy_loss - seer_entropy_bonus
-    
-    # discrete_messages shape is (seq_len, batch_size, d).
-    
-    return total_actor_loss, {
-        "actor_loss": actor_loss, 
+
+    seer_loss = seer_actor_loss - seer_entropy_coef * thought_variance
+    doer_loss = doer_actor_loss - entropy_coef * entropy
+
+    return (seer_loss, doer_loss), {
+        "seer_actor_loss": seer_actor_loss,
+        "doer_actor_loss": doer_actor_loss,
         "entropy": entropy,
         "ratio": ratio.mean(),
         "thought_variance": thought_variance,
@@ -129,7 +122,7 @@ def calculate_critic_loss(
     
     # The critic uses the global observation (CTDE)
     values = critic_apply_fn({"params": critic_params}, transition_batch.global_obs)
-    
+
     value_pred_clipped = transition_batch.value + jnp.clip(
         values - transition_batch.value, -value_clip, value_clip
     )
@@ -189,19 +182,57 @@ def update_actor(
             mb_seer_carry = jax.tree_util.tree_map(lambda x: x[indices], init_seer_carry)
             mb_doer_carry = jax.tree_util.tree_map(lambda x: x[indices], init_doer_carry)
             
-            loss_fn = lambda params: calculate_actor_loss(
-                seer_apply_fn, doer_apply_fn, params, mb_transition_time_first, mb_seer_carry, mb_doer_carry, seer_entropy_coef=seer_entropy_coef
-            )
-            
-            (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-            
+            def seer_loss_fn(seer_params):
+                (seer_loss, _), metrics = calculate_actor_losses(
+                    seer_apply_fn,
+                    doer_apply_fn,
+                    {"seer": seer_params, "doer": state.params["doer"]},
+                    mb_transition_time_first,
+                    mb_seer_carry,
+                    mb_doer_carry,
+                    seer_entropy_coef=seer_entropy_coef,
+                )
+                return seer_loss, metrics
+
+            def doer_loss_fn(doer_params):
+                (_, doer_loss), metrics = calculate_actor_losses(
+                    seer_apply_fn,
+                    doer_apply_fn,
+                    {"seer": state.params["seer"], "doer": doer_params},
+                    mb_transition_time_first,
+                    mb_seer_carry,
+                    mb_doer_carry,
+                    seer_entropy_coef=seer_entropy_coef,
+                )
+                return doer_loss, metrics
+
+            (seer_loss, seer_metrics), seer_grads = jax.value_and_grad(
+                seer_loss_fn,
+                has_aux=True,
+            )(state.params["seer"])
+            (doer_loss, doer_metrics), doer_grads = jax.value_and_grad(
+                doer_loss_fn,
+                has_aux=True,
+            )(state.params["doer"])
+
+            grads = {"seer": seer_grads, "doer": doer_grads}
+
             # Record explicit gradient norms for auditing
             seer_grad_norm = optax.global_norm(grads["seer"])
             doer_grad_norm = optax.global_norm(grads["doer"])
-            # jax.debug.print("Seer Grad Norm: {norm}", norm=seer_grad_norm)
-            
-            metrics["seer_grad_norm"] = seer_grad_norm
-            metrics["doer_grad_norm"] = doer_grad_norm
+
+            metrics = {
+                "seer_loss": seer_loss,
+                "doer_loss": doer_loss,
+                "seer_actor_loss": seer_metrics["seer_actor_loss"],
+                "doer_actor_loss": doer_metrics["doer_actor_loss"],
+                "entropy": doer_metrics["entropy"],
+                "ratio": doer_metrics["ratio"],
+                "thought_variance": seer_metrics["thought_variance"],
+                "discrete_messages": seer_metrics["discrete_messages"],
+                "seer_grad_norm": seer_grad_norm,
+                "doer_grad_norm": doer_grad_norm,
+            }
             
             new_state = state.apply_gradients(grads=grads)
             return new_state, metrics

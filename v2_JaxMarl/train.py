@@ -27,7 +27,7 @@ class GlobalCritic(nn.Module):
         x = x.reshape((x.shape[0], -1))
         x = nn.Dense(features=128)(x)
         x = nn.relu(x)
-        value = nn.Dense(features=1)(x)
+        value = nn.Dense(features=2)(x)
         return value
 
 def main():
@@ -40,10 +40,13 @@ def main():
         "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [2] * 8, # Defines the categorical hypercube
         "seed": 42,
+        "train_epsilon": 0.1,
+        "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.1,
         "cic_coef": 0.01,
         "min_start_distance": 6.0,
         "step_penalty": 0.01,
+        "bump_penalty": 0.1,
         "visualize_every": 50,
         "visualize_max_steps": 200,
         "visualize_dir": "artifacts/episodes",
@@ -63,6 +66,7 @@ def main():
         progress_reward_scale=config["progress_reward_scale"],
         min_start_distance=config["min_start_distance"],
         step_penalty=config["step_penalty"],
+        bump_penalty=config["bump_penalty"],
     )
 
     # 4. Initial Environment Reset
@@ -119,7 +123,14 @@ def main():
         tx=tx
     )
 
-    step_fn = make_rollout_step(env, seer.apply, doer.apply, critic.apply)
+    step_fn = make_rollout_step(
+        env,
+        seer.apply,
+        doer.apply,
+        critic.apply,
+        train_epsilon=config["train_epsilon"],
+        follow_reward_scale=config["follow_reward_scale"],
+    )
 
     # 8. The Main Training Loop
     num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
@@ -185,7 +196,8 @@ def main():
             #     "actor_loss": actor_metrics.get("actor_loss", 0.0),
             #     "entropy": actor_metrics.get("entropy", 0.0),
             #     "critic_loss": critic_metrics.get("critic_loss", 0.0),
-            #     "mean_reward": trajectory_batch.reward.mean(),
+            #     "seer_reward": trajectory_batch.reward[..., 0].mean(),
+            #     "doer_reward": trajectory_batch.reward[..., 1].mean(),
             #     "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
             #     "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
             #     "thought_variance": actor_metrics.get("thought_variance", 0.0),
@@ -200,7 +212,14 @@ def main():
                 init_doer_carry,
                 cic_rng
             )
-            print(f"Update {update}/{num_updates} | Reward: {trajectory_batch.reward.mean():.3f} | Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | CIC: {cic_score:.3f}")
+            print(
+                f"Update {update}/{num_updates} | "
+                f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
+                f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
+                f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
+                f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
+                f"CIC: {cic_score:.3f}"
+            )
             
             # Log a small sample of the discrete messages to see distribution
             sample_msgs = actor_metrics.get("discrete_messages")
