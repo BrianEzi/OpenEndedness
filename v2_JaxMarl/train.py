@@ -39,15 +39,11 @@ def main():
         "num_steps": 128,
         "total_timesteps": 1_000_000,
         "env_id": "Navix-Empty-Random-8x8-v0",
-        "fsq_levels": [2] * 8, # Defines the categorical hypercube
+        "fsq_levels": [4], # Defines the categorical hypercube
         "seed": 42,
-        "train_epsilon": 0.1,
-        "follow_reward_scale": 0.1,
-        "progress_reward_scale": 0.1,
-        "cic_coef": 0.01,
-        "min_start_distance": 1.0,
-        "progress_reward_scale": 0.3,
-        "cic_coef": 0.05,
+        "follow_reward_scale": 0.02,
+        "progress_reward_scale": 0.2,
+        "cic_coef": 0.0,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
@@ -132,7 +128,6 @@ def main():
         seer.apply,
         doer.apply,
         critic.apply,
-        train_epsilon=config["train_epsilon"],
         follow_reward_scale=config["follow_reward_scale"],
     )
 

@@ -13,7 +13,6 @@ def make_rollout_step(
     seer_apply_fn,
     doer_apply_fn,
     critic_apply_fn,
-    train_epsilon=0.1,
     follow_reward_scale=0.1,
 ):
     """
@@ -21,7 +20,6 @@ def make_rollout_step(
     Passing the environment and apply functions here avoids passing them 
     repeatedly into the compiled loop.
     """
-    train_epsilon = jnp.asarray(train_epsilon, dtype=jnp.float32)
     follow_reward_scale = jnp.asarray(follow_reward_scale, dtype=jnp.float32)
     
     def rollout_step(runner_state: Tuple, _):
@@ -34,7 +32,7 @@ def make_rollout_step(
         num_envs = env_obs["global_map"].shape[0]
         
         # Split the PRNG key for the stochastic actions
-        rng, doer_rng, eps_rng, env_rng = jax.random.split(rng, 4)
+        rng, doer_rng, env_rng = jax.random.split(rng, 3)
         env_step_keys = jax.random.split(env_rng, num_envs)
         
         # 1. Seer Forward Pass (Prefrontal Cortex)
@@ -73,23 +71,8 @@ def make_rollout_step(
         # 3. Action Selection
         pi = distrax.Categorical(logits=action_logits)
         null_pi = distrax.Categorical(logits=null_action_logits)
-        greedy_action = jnp.argmax(action_logits, axis=-1).astype(jnp.int32)
-        random_action = jax.random.randint(
-            doer_rng,
-            shape=(num_envs,),
-            minval=0,
-            maxval=action_logits.shape[-1],
-            dtype=jnp.int32,
-        )
-        take_random = jax.random.uniform(eps_rng, shape=(num_envs,)) < train_epsilon
-        action = jnp.where(take_random, random_action, greedy_action)
-
-        # Store the behavior-policy log-prob for PPO ratio calculation.
-        num_actions = jnp.asarray(action_logits.shape[-1], dtype=jnp.float32)
-        uniform_prob = train_epsilon / num_actions
-        greedy_prob = (1.0 - train_epsilon) + uniform_prob
-        behavior_prob = jnp.where(action == greedy_action, greedy_prob, uniform_prob)
-        log_prob = jnp.log(jnp.clip(behavior_prob, a_min=1e-8))
+        action = pi.sample(seed=doer_rng)
+        log_prob = pi.log_prob(action)
         follow_reward = jnp.maximum(
             pi.log_prob(action) - null_pi.log_prob(action),
             0.0,

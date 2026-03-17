@@ -23,7 +23,8 @@ class NavixGridWrapper:
 
     @property
     def num_actions(self) -> int:
-        return int(self._env.action_space.n)
+        # Navigation-only action space: turn left, turn right, move forward.
+        return 3
 
     def _split_observations(self, timestep, vision_radius: jnp.ndarray):
         state = timestep.state
