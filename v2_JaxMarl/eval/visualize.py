@@ -63,10 +63,6 @@ def visualize_episode(
             vision_radius=vision_radius,
         )
 
-        print(
-            f"Viz step {step_count} | Message: {message[0]} | "
-            f"Action: {int(action)} | Reward: {float(reward):.3f}"
-        )
         step_count += 1
 
     if not frames:

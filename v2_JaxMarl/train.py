@@ -47,8 +47,8 @@ def main():
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "visualize_every": 50,
-        "visualize_max_steps": 50,
+        "visualize_every": 100,
+        "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
     }
     
@@ -272,7 +272,7 @@ def main():
             
             
 
-        if update % config["visualize_every"] == 0:
+        if update > 0 and update % config["visualize_every"] == 0:
             rng, viz_rng = jax.random.split(rng)
             viz_path = Path(config["visualize_dir"]) / f"episode_{update:05d}.gif"
             visualize_episode(
