@@ -44,6 +44,7 @@ def main():
         "follow_reward_scale": 0.02,
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
+        "doer_perception_level": 0,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
@@ -67,6 +68,7 @@ def main():
         min_start_distance=config["min_start_distance"],
         step_penalty=config["step_penalty"],
         bump_penalty=config["bump_penalty"],
+        doer_perception_level=config["doer_perception_level"],
     )
 
     # 4. Initial Environment Reset

@@ -14,12 +14,14 @@ class NavixGridWrapper:
         min_start_distance: float = 0.0,
         step_penalty: float = 0.0,
         bump_penalty: float = 0.1,
+        doer_perception_level: int = 0,
     ):
         self._env = env
         self.progress_reward_scale = progress_reward_scale
         self.min_start_distance = jnp.asarray(min_start_distance, dtype=jnp.float32)
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.bump_penalty = jnp.asarray(bump_penalty, dtype=jnp.float32)
+        self.doer_perception_level = int(doer_perception_level)
 
     @property
     def num_actions(self) -> int:
@@ -35,7 +37,7 @@ class NavixGridWrapper:
         goal = state.get_goals()
         center_row = full_local_view.shape[0] // 2
         center_col = full_local_view.shape[1] // 2
-        local_view = jax.lax.dynamic_slice(
+        local_view_3x3 = jax.lax.dynamic_slice(
             full_local_view,
             (center_row - 1, center_col - 1, 0),
             (3, 3, full_local_view.shape[-1]),
@@ -53,7 +55,7 @@ class NavixGridWrapper:
             dtype=jnp.float32,
         )
 
-        proprioception = jnp.array(
+        proprioception_full = jnp.array(
             [
                 player.position[0],
                 player.position[1],
@@ -62,6 +64,33 @@ class NavixGridWrapper:
             ],
             dtype=jnp.float32,
         )
+
+        if self.doer_perception_level == 0:
+            local_view = local_view_3x3
+            proprioception = proprioception_full
+        elif self.doer_perception_level == 1:
+            local_view = jnp.zeros_like(local_view_3x3)
+            local_view = local_view.at[0, 1].set(local_view_3x3[0, 1])
+            proprioception = proprioception_full
+        elif self.doer_perception_level == 2:
+            local_view = jnp.zeros_like(local_view_3x3)
+            proprioception = jnp.array(
+                [
+                    player.position[0],
+                    player.position[1],
+                    0.0,
+                    0.0,
+                ],
+                dtype=jnp.float32,
+            )
+        elif self.doer_perception_level == 3:
+            local_view = jnp.zeros_like(local_view_3x3)
+            proprioception = jnp.zeros_like(proprioception_full)
+        else:
+            raise ValueError(
+                f"Unsupported doer_perception_level={self.doer_perception_level}. "
+                "Use 0, 1, 2, or 3."
+            )
 
         return {
             "global_map": global_map,
