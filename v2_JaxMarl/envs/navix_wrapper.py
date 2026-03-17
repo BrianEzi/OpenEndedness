@@ -25,40 +25,20 @@ class NavixGridWrapper:
     def num_actions(self) -> int:
         return int(self._env.action_space.n)
 
-    @staticmethod
-    def _direction_delta(direction: jnp.ndarray) -> jnp.ndarray:
-        # Navix follows the MiniGrid convention: right, down, left, up.
-        deltas = jnp.array(
-            [
-                [0, 1],
-                [1, 0],
-                [0, -1],
-                [-1, 0],
-            ],
-            dtype=jnp.int32,
-        )
-        return deltas[direction.astype(jnp.int32)]
-
     def _split_observations(self, timestep, vision_radius: jnp.ndarray):
         state = timestep.state
         global_map = observations.symbolic(state).astype(jnp.float32)
+        full_local_view = observations.symbolic_first_person(state).astype(jnp.float32)
 
         player = state.get_player()
         goal = state.get_goals()
-        direction_delta = self._direction_delta(player.direction)
-        grid_shape = jnp.asarray(global_map.shape[:2], dtype=jnp.int32)
-        front_position = jnp.clip(
-            player.position + direction_delta,
-            0,
-            grid_shape - 1,
+        center_row = full_local_view.shape[0] // 2
+        center_col = full_local_view.shape[1] // 2
+        local_view = jax.lax.dynamic_slice(
+            full_local_view,
+            (center_row - 1, center_col - 1, 0),
+            (3, 3, full_local_view.shape[-1]),
         )
-        current_cell = global_map[player.position[0], player.position[1]]
-        front_cell = global_map[front_position[0], front_position[1]]
-
-        # The Doer only sees its own tile plus the tile directly in front.
-        local_view = jnp.zeros((3, 3, global_map.shape[-1]), dtype=jnp.float32)
-        local_view = local_view.at[1, 1].set(current_cell)
-        local_view = local_view.at[0, 1].set(front_cell)
 
         symbolic_state = jnp.array(
             [

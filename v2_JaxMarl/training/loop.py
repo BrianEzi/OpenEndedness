@@ -112,7 +112,7 @@ def make_rollout_step(
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
         seer_reward = task_reward + progress_reward - step_penalty
-        doer_reward = task_reward + follow_reward - step_penalty - bump_penalty
+        doer_reward = task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
         reward = jnp.stack([seer_reward, doer_reward], axis=-1)
 
         done_mask = done[:, None]
@@ -181,17 +181,7 @@ def generate_trajectory_and_gae(
     # The critic evaluates the state *after* the final step
     last_val = critic_apply_fn({"params": params["critic"]}, final_global_map)
     
-    # 4. Compute CIC and Intrinsic Reward
-    rng, cic_rng = jax.random.split(rng)
-    cic_score = compute_cic(
-        doer_apply_fn,
-        params["doer"],
-        trajectory_batch,
-        doer_carry,
-        cic_rng
-    )
-    
-    reward_with_cic = trajectory_batch.reward.at[..., 1].add(cic_coef * cic_score)
+    reward_with_cic = trajectory_batch.reward
     
     # 5. Compute GAE
     # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 

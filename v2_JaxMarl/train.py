@@ -41,9 +41,9 @@ def main():
         "fsq_levels": [2] * 8, # Defines the categorical hypercube
         "seed": 42,
         "train_epsilon": 0.1,
-        "follow_reward_scale": 0.1,
-        "progress_reward_scale": 0.1,
-        "cic_coef": 0.01,
+        "follow_reward_scale": 0.02,
+        "progress_reward_scale": 0.2,
+        "cic_coef": 0.0,
         "min_start_distance": 6.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
