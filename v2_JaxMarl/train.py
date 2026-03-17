@@ -15,6 +15,7 @@ import navix as nx
 from eval.metrics import compute_cic
 from eval.visualize import visualize_episode
 import numpy as np
+import wandb
 
 
 # For the sake of a complete script, here is a pragmatic, standard Critic
@@ -41,18 +42,21 @@ def main():
         "fsq_levels": [2] * 8, # Defines the categorical hypercube
         "seed": 42,
         "train_epsilon": 0.1,
-        "follow_reward_scale": 0.02,
-        "progress_reward_scale": 0.2,
-        "cic_coef": 0.0,
-        "min_start_distance": 6.0,
+        "follow_reward_scale": 0.1,
+        "progress_reward_scale": 0.1,
+        "cic_coef": 0.01,
+        "min_start_distance": 1.0,
+        "progress_reward_scale": 0.3,
+        "cic_coef": 0.05,
+        "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
         "visualize_every": 50,
-        "visualize_max_steps": 200,
+        "visualize_max_steps": 50,
         "visualize_dir": "artifacts/episodes",
     }
     
-    # wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+    wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
     
     # 2. PRNG Key Initialization
     # JAX requires explicit, rigorous management of randomness
@@ -191,19 +195,19 @@ def main():
         
         # D. Logging
         if update % 10 == 0:
-            # wandb.log({
-            #     "update": update,
-            #     "actor_loss": actor_metrics.get("actor_loss", 0.0),
-            #     "entropy": actor_metrics.get("entropy", 0.0),
-            #     "critic_loss": critic_metrics.get("critic_loss", 0.0),
-            #     "seer_reward": trajectory_batch.reward[..., 0].mean(),
-            #     "doer_reward": trajectory_batch.reward[..., 1].mean(),
-            #     "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
-            #     "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
-            #     "thought_variance": actor_metrics.get("thought_variance", 0.0),
-            #     "vision_radius": vision_radius,
-            #     "seer_entropy_coef": seer_entropy_coef
-            # })
+            wandb.log({
+                "update": update,
+                "actor_loss": actor_metrics.get("actor_loss", 0.0),
+                "entropy": actor_metrics.get("entropy", 0.0),
+                "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                "seer_reward": trajectory_batch.reward[..., 0].mean(),
+                "doer_reward": trajectory_batch.reward[..., 1].mean(),
+                "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
+                "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
+                "thought_variance": actor_metrics.get("thought_variance", 0.0),
+                "vision_radius": vision_radius,
+                "seer_entropy_coef": seer_entropy_coef
+            })
             rng, cic_rng = jax.random.split(rng)
             cic_score = compute_cic(
                 doer.apply,
@@ -260,16 +264,16 @@ def main():
                 ax.set_xlabel("Doer Action")
                 ax.set_ylabel("Seer Message Index")
                 ax.set_title(f"Signal-to-Action Heatmap (CIC: {cic_score:.3f})")
-                #heatmap_log = wandb.Image(fig)
+                heatmap_log = wandb.Image(fig)
                 plt.close(fig)
             except ImportError:
-                #heatmap_log = wandb.Image(H / (H.max() + 1e-8))
+                heatmap_log = wandb.Image(H / (H.max() + 1e-8))
                 pass
 
-            # wandb.log({
-            #     "CIC_Score": cic_score,
-            #     "Signal_Action_Heatmap": heatmap_log
-            # }, commit=False)
+            wandb.log({
+                "CIC_Score": cic_score,
+                "Signal_Action_Heatmap": heatmap_log
+            }, commit=False)
             
             
 
