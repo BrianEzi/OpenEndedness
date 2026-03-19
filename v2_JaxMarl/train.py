@@ -138,7 +138,10 @@ def main():
     # 8. The Main Training Loop
     num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
     
-    print("Starting training...")
+    print(
+        "Starting training... "
+        f"(doer_perception_level={config['doer_perception_level']})"
+    )
     for update in range(num_updates):
         rng, rollout_rng = jax.random.split(rng)
         
@@ -224,6 +227,7 @@ def main():
             )
             print(
                 f"Update {update}/{num_updates} | "
+                f"Level: {config['doer_perception_level']} | "
                 f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
                 f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
                 f"Task: {trajectory_batch.task_reward.mean():.3f} | "
