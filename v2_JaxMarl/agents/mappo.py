@@ -21,6 +21,11 @@ class Transition:
     log_prob: chex.Array
     value: chex.Array
     reward: chex.Array
+    task_reward: chex.Array
+    progress_reward: chex.Array
+    follow_reward: chex.Array
+    step_penalty_component: chex.Array
+    bump_penalty_component: chex.Array
     done: chex.Array
     advantage: chex.Array
     return_val: chex.Array

@@ -119,6 +119,11 @@ def make_rollout_step(
             log_prob=log_prob,
             value=value,
             reward=reward,
+            task_reward=task_reward,
+            progress_reward=progress_reward,
+            follow_reward=follow_reward,
+            step_penalty_component=step_penalty,
+            bump_penalty_component=bump_penalty,
             done=done,
             # Advantage and return will be calculated post-rollout using GAE
             advantage=jnp.zeros_like(reward), 

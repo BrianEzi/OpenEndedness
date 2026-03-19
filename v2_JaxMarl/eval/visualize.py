@@ -27,6 +27,7 @@ def visualize_episode(
     doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
 
     done = False
+    solved = False
     step_count = 0
 
     while not bool(done) and step_count < max_steps:
@@ -56,12 +57,13 @@ def visualize_episode(
         action = jnp.argmax(action_logits[0]).astype(jnp.int32)
 
         rng, step_rng = jax.random.split(rng)
-        obs, state, reward, done, _ = env.step(
+        obs, state, reward, done, info = env.step(
             step_rng,
             state,
             action,
             vision_radius=vision_radius,
         )
+        solved = solved or bool(done) and float(info["task_reward"]) > 0.0
 
         step_count += 1
 
@@ -76,4 +78,4 @@ def visualize_episode(
         loop=0,
     )
     print(f"Episode saved to {output_path}")
-    return output_path
+    return output_path, solved

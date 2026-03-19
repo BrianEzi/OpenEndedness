@@ -45,6 +45,7 @@ def main():
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
         "doer_perception_level": 0,
+        "curriculum_success_streak": 3,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
@@ -132,6 +133,7 @@ def main():
         critic.apply,
         follow_reward_scale=config["follow_reward_scale"],
     )
+    success_streak = 0
 
     # 8. The Main Training Loop
     num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
@@ -199,11 +201,18 @@ def main():
                 "critic_loss": critic_metrics.get("critic_loss", 0.0),
                 "seer_reward": trajectory_batch.reward[..., 0].mean(),
                 "doer_reward": trajectory_batch.reward[..., 1].mean(),
+                "task_reward": trajectory_batch.task_reward.mean(),
+                "progress_reward": trajectory_batch.progress_reward.mean(),
+                "follow_reward": trajectory_batch.follow_reward.mean(),
+                "step_penalty_component": trajectory_batch.step_penalty_component.mean(),
+                "bump_penalty_component": trajectory_batch.bump_penalty_component.mean(),
                 "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
                 "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
                 "thought_variance": actor_metrics.get("thought_variance", 0.0),
                 "vision_radius": vision_radius,
-                "seer_entropy_coef": seer_entropy_coef
+                "seer_entropy_coef": seer_entropy_coef,
+                "doer_perception_level": config["doer_perception_level"],
+                "curriculum_success_streak": success_streak,
             })
             rng, cic_rng = jax.random.split(rng)
             cic_score = compute_cic(
@@ -217,6 +226,11 @@ def main():
                 f"Update {update}/{num_updates} | "
                 f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
                 f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
+                f"Task: {trajectory_batch.task_reward.mean():.3f} | "
+                f"Progress: {trajectory_batch.progress_reward.mean():.3f} | "
+                f"Follow: {trajectory_batch.follow_reward.mean():.3f} | "
+                f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
+                f"Bump: {trajectory_batch.bump_penalty_component.mean():.3f} | "
                 f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
                 f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
                 f"CIC: {cic_score:.3f}"
@@ -277,7 +291,7 @@ def main():
         if update > 0 and update % config["visualize_every"] == 0:
             rng, viz_rng = jax.random.split(rng)
             viz_path = Path(config["visualize_dir"]) / f"episode_{update:05d}.gif"
-            visualize_episode(
+            _, solved = visualize_episode(
                 env,
                 params,
                 viz_rng,
@@ -287,6 +301,35 @@ def main():
                 vision_radius=vision_radius,
                 max_steps=config["visualize_max_steps"],
             )
+            if solved:
+                success_streak += 1
+            else:
+                success_streak = 0
+
+            if (
+                success_streak >= config["curriculum_success_streak"]
+                and config["doer_perception_level"] < 3
+            ):
+                config["doer_perception_level"] += 1
+                success_streak = 0
+                env.doer_perception_level = config["doer_perception_level"]
+                step_fn = make_rollout_step(
+                    env,
+                    seer.apply,
+                    doer.apply,
+                    critic.apply,
+                    follow_reward_scale=config["follow_reward_scale"],
+                )
+
+                rng, env_rng = jax.random.split(rng, 2)
+                reset_keys = jax.random.split(env_rng, config["num_envs"])
+                env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
+                seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                print(
+                    f"Curriculum advanced to doer_perception_level="
+                    f"{config['doer_perception_level']}"
+                )
 
 if __name__ == "__main__":
     main()
