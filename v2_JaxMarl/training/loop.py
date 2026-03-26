@@ -107,14 +107,17 @@ def make_rollout_step(
         progress_reward = info["progress_reward"]
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
+        shared_comm_reward = (
+            task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
+        )
         seer_reward = jnp.where(
             communication_mode,
-            task_reward + progress_reward - step_penalty,
+            shared_comm_reward,
             task_reward + progress_reward - step_penalty - bump_penalty,
         )
         doer_reward = jnp.where(
             communication_mode,
-            task_reward + progress_reward + follow_reward - step_penalty - bump_penalty,
+            shared_comm_reward,
             jnp.asarray(0.0, dtype=jnp.float32),
         )
         reward = jnp.stack([seer_reward, doer_reward], axis=-1)
