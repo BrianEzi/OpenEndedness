@@ -7,6 +7,9 @@ from navix import observations
 class NavixGridWrapper:
     """Expose Navix single-agent environments with the Seer/Doer observation split."""
 
+    SEER_NAV_PHASE = 0
+    COMMUNICATION_PHASE = 1
+
     def __init__(
         self,
         env,
@@ -28,7 +31,12 @@ class NavixGridWrapper:
         # Navigation-only action space: turn left, turn right, move forward.
         return 3
 
-    def _split_observations(self, timestep, vision_radius: jnp.ndarray):
+    def _split_observations(
+        self,
+        timestep,
+        vision_radius: jnp.ndarray,
+        control_mode: jnp.ndarray,
+    ):
         state = timestep.state
         global_map = observations.symbolic(state).astype(jnp.float32)
         full_local_view = observations.symbolic_first_person(state).astype(jnp.float32)
@@ -51,6 +59,7 @@ class NavixGridWrapper:
                 player.pocket,
                 goal.position[0, 0],
                 goal.position[0, 1],
+                (control_mode == self.SEER_NAV_PHASE).astype(jnp.float32),
             ],
             dtype=jnp.float32,
         )
@@ -105,7 +114,12 @@ class NavixGridWrapper:
         goal = state.get_goals()
         return jnp.abs(player.position - goal.position[0]).sum().astype(jnp.float32)
 
-    def reset(self, key: jnp.ndarray, vision_radius: jnp.ndarray = jnp.array(3.0)):
+    def reset(
+        self,
+        key: jnp.ndarray,
+        vision_radius: jnp.ndarray = jnp.array(3.0),
+        control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+    ):
         timestep = self._env.reset(key)
         distance = self._goal_distance(timestep.state)
 
@@ -125,11 +139,16 @@ class NavixGridWrapper:
             body_fn,
             (key, timestep, distance),
         )
-        obs = self._split_observations(timestep, vision_radius)
+        obs = self._split_observations(timestep, vision_radius, control_mode)
         return obs, timestep
 
-    def reset_batch(self, keys: jnp.ndarray, vision_radius: jnp.ndarray = jnp.array(3.0)):
-        return jax.vmap(self.reset, in_axes=(0, None))(keys, vision_radius)
+    def reset_batch(
+        self,
+        keys: jnp.ndarray,
+        vision_radius: jnp.ndarray = jnp.array(3.0),
+        control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+    ):
+        return jax.vmap(self.reset, in_axes=(0, None, None))(keys, vision_radius, control_mode)
 
     def step(
         self,
@@ -137,9 +156,14 @@ class NavixGridWrapper:
         timestep,
         action: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
+        control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
     ):
         def reset_branch(_):
-            reset_obs, reset_timestep = self.reset(key, vision_radius=vision_radius)
+            reset_obs, reset_timestep = self.reset(
+                key,
+                vision_radius=vision_radius,
+                control_mode=control_mode,
+            )
             reward = jnp.asarray(0.0, dtype=jnp.float32)
             done = jnp.asarray(False)
             info = {
@@ -158,7 +182,7 @@ class NavixGridWrapper:
             next_timestep = self._env.step(timestep, action)
             new_distance = self._goal_distance(next_timestep.state)
             new_position = next_timestep.state.get_player().position
-            obs = self._split_observations(next_timestep, vision_radius)
+            obs = self._split_observations(next_timestep, vision_radius, control_mode)
             task_reward = next_timestep.reward.astype(jnp.float32)
             progress_reward = (old_distance - new_distance) * self.progress_reward_scale
             step_penalty = self.step_penalty
@@ -189,8 +213,35 @@ class NavixGridWrapper:
         timesteps,
         actions: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
+        control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
     ):
-        return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, timesteps, actions, vision_radius)
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None, None))(
+            keys,
+            timesteps,
+            actions,
+            vision_radius,
+            control_mode,
+        )
 
-    def render(self, timestep):
-        return np.asarray(observations.rgb(timestep.state))
+    def render(
+        self,
+        timestep,
+        control_mode: int = COMMUNICATION_PHASE,
+    ):
+        frame = np.asarray(observations.rgb(timestep.state)).copy()
+        grid = np.asarray(observations.symbolic(timestep.state))
+        player = np.asarray(timestep.state.get_player().position).astype(np.int32)
+        tile_h = max(frame.shape[0] // grid.shape[0], 1)
+        tile_w = max(frame.shape[1] // grid.shape[1], 1)
+        row, col = int(player[0]), int(player[1])
+        y0 = row * tile_h + tile_h // 4
+        y1 = min((row + 1) * tile_h - tile_h // 4, frame.shape[0])
+        x0 = col * tile_w + tile_w // 4
+        x1 = min((col + 1) * tile_w - tile_w // 4, frame.shape[1])
+        color = (
+            np.array([32, 96, 224], dtype=np.uint8)
+            if control_mode == self.SEER_NAV_PHASE
+            else np.array([0, 0, 0], dtype=np.uint8)
+        )
+        frame[y0:y1, x0:x1] = color
+        return frame

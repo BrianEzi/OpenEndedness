@@ -12,6 +12,7 @@ class Seer(nn.Module):
     Observes the global state and generates a discrete compositional message.
     """
     fsq_levels: Sequence[int]
+    num_actions: int = 3
     lstm_features: int = 128
 
     @nn.compact
@@ -20,7 +21,7 @@ class Seer(nn.Module):
         carry: Tuple[jnp.ndarray, jnp.ndarray], 
         map_obs: jnp.ndarray, 
         symbolic_obs: jnp.ndarray
-    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Args:
             carry: A tuple of (hidden_state, cell_state) for the LSTM.
@@ -31,6 +32,7 @@ class Seer(nn.Module):
             new_carry: Updated LSTM state for the next timestep $t+1$.
             discrete_message: The quantized $m_t$ vector sent to the Doer.
             thought_vector: The continuous pre-quantization vector (useful for logging/critic).
+            navigation_logits: Action logits used while the Seer is embodied.
         """
         
         # 1. Visual Encoder: CNN for the grid visual 
@@ -68,8 +70,11 @@ class Seer(nn.Module):
         # Transforms the continuous thought vector into the discrete message $m_t$ 
         fsq = FSQ(levels=self.fsq_levels)
         discrete_message = fsq(thought_vector)
-        
-        return new_carry, discrete_message, thought_vector
+
+        # During the pretraining phase the Seer physically navigates the grid.
+        navigation_logits = nn.Dense(features=self.num_actions)(lstm_out)
+
+        return new_carry, discrete_message, thought_vector, navigation_logits
 
     @staticmethod
     def initialize_carry(batch_size: int, hidden_size: int) -> Tuple[jnp.ndarray, jnp.ndarray]:

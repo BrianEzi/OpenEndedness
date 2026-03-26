@@ -28,11 +28,12 @@ def make_rollout_step(
         Designed to be passed directly to jax.lax.scan.
         """
         # Unpack the runner state
-        params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius = runner_state
+        params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius, control_mode = runner_state
         num_envs = env_obs["global_map"].shape[0]
+        communication_mode = control_mode == 1
         
         # Split the PRNG key for the stochastic actions
-        rng, doer_rng, env_rng = jax.random.split(rng, 3)
+        rng, seer_rng, doer_rng, env_rng = jax.random.split(rng, 4)
         env_step_keys = jax.random.split(env_rng, num_envs)
         
         # 1. Seer Forward Pass (Prefrontal Cortex)
@@ -41,7 +42,7 @@ def make_rollout_step(
         global_map = env_obs["global_map"]
         symbolic_obs = env_obs["symbolic_state"]
         
-        next_seer_carry, discrete_message, _ = seer_apply_fn(
+        next_seer_carry, discrete_message, _, seer_nav_logits = seer_apply_fn(
             {"params": params["seer"]}, 
             seer_carry, 
             global_map, 
@@ -69,14 +70,22 @@ def make_rollout_step(
         )
         
         # 3. Action Selection
+        seer_pi = distrax.Categorical(logits=seer_nav_logits)
         pi = distrax.Categorical(logits=action_logits)
         null_pi = distrax.Categorical(logits=null_action_logits)
-        action = pi.sample(seed=doer_rng)
-        log_prob = pi.log_prob(action)
-        follow_reward = jnp.maximum(
-            pi.log_prob(action) - null_pi.log_prob(action),
-            0.0,
-        ) * follow_reward_scale
+        seer_action = seer_pi.sample(seed=seer_rng)
+        doer_action = pi.sample(seed=doer_rng)
+        seer_log_prob = seer_pi.log_prob(seer_action)
+        doer_log_prob = pi.log_prob(doer_action)
+        env_action = jnp.where(communication_mode, doer_action, seer_action)
+        follow_reward = jnp.where(
+            communication_mode,
+            jnp.maximum(
+                pi.log_prob(doer_action) - null_pi.log_prob(doer_action),
+                0.0,
+            ) * follow_reward_scale,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         
         # 4. Critic Forward Pass (Centralized Training)
         # The critic evaluates the global state to guide learning[cite: 111].
@@ -87,15 +96,27 @@ def make_rollout_step(
         # Note: jaxmarl expects a dictionary of actions for multi-agent, 
         # adapt this based on your specific wrapper implementation.
         next_env_obs, next_env_state, reward, done, info = env.step_batch(
-            env_step_keys, env_state, action, vision_radius=vision_radius
+            env_step_keys,
+            env_state,
+            env_action,
+            vision_radius=vision_radius,
+            control_mode=control_mode,
         )
 
         task_reward = info["task_reward"]
         progress_reward = info["progress_reward"]
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
-        seer_reward = task_reward + progress_reward - step_penalty
-        doer_reward = task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
+        seer_reward = jnp.where(
+            communication_mode,
+            task_reward + progress_reward - step_penalty,
+            task_reward + progress_reward - step_penalty - bump_penalty,
+        )
+        doer_reward = jnp.where(
+            communication_mode,
+            task_reward + progress_reward + follow_reward - step_penalty - bump_penalty,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         reward = jnp.stack([seer_reward, doer_reward], axis=-1)
 
         done_mask = done[:, None]
@@ -115,8 +136,10 @@ def make_rollout_step(
             local_obs=local_obs,
             proprioception=proprioception,
             message=discrete_message,
-            action=action,
-            log_prob=log_prob,
+            doer_action=doer_action,
+            doer_log_prob=doer_log_prob,
+            seer_action=seer_action,
+            seer_log_prob=seer_log_prob,
             value=value,
             reward=reward,
             task_reward=task_reward,
@@ -132,7 +155,14 @@ def make_rollout_step(
         
         # Repack the updated runner state
         next_runner_state = (
-            params, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, rng, vision_radius
+            params,
+            next_seer_carry,
+            next_doer_carry,
+            next_env_state,
+            next_env_obs,
+            rng,
+            vision_radius,
+            control_mode,
         )
         
         return next_runner_state, transition
@@ -143,7 +173,7 @@ import functools
 
 @functools.partial(jax.jit, static_argnames=("num_steps", "step_fn", "critic_apply_fn", "doer_apply_fn"))
 def generate_trajectory_and_gae(
-    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
+    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, control_mode: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
     step_fn, critic_apply_fn, doer_apply_fn
 ):
     """
@@ -151,7 +181,16 @@ def generate_trajectory_and_gae(
     Note: We pass the pre-compiled step_fn and initial states directly here 
     for better JAX compilation efficiency.
     """
-    initial_runner_state = (params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius)
+    initial_runner_state = (
+        params,
+        seer_carry,
+        doer_carry,
+        env_state,
+        env_obs,
+        rng,
+        vision_radius,
+        control_mode,
+    )
     
     # 1. Execute the scan loop to collect the raw trajectory
     final_runner_state, trajectory_batch = jax.lax.scan(
@@ -160,7 +199,7 @@ def generate_trajectory_and_gae(
     
     # 2. Extract the final state for Critic bootstrapping
     # Unpack the final runner state to get the last env_obs
-    _, _, _, _, final_env_obs, _, _ = final_runner_state
+    _, _, _, _, final_env_obs, _, _, _ = final_runner_state
     
     # Enforce CTDE: The critic evaluates the global map 
     final_global_map = final_env_obs["global_map"]

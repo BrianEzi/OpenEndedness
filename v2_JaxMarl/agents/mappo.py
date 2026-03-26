@@ -17,8 +17,10 @@ class Transition:
     local_obs: chex.Array   # For the Doer
     proprioception: chex.Array # For the Doer
     message: chex.Array     # For CIC and Heatmap logging
-    action: chex.Array
-    log_prob: chex.Array
+    doer_action: chex.Array
+    doer_log_prob: chex.Array
+    seer_action: chex.Array
+    seer_log_prob: chex.Array
     value: chex.Array
     reward: chex.Array
     task_reward: chex.Array
@@ -38,6 +40,7 @@ def calculate_actor_losses(
     transition_batch: Transition,
     init_seer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
     init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
+    control_mode: jnp.ndarray,
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01)
@@ -57,7 +60,7 @@ def calculate_actor_losses(
         seer_carry, doer_carry = carry
         
         # Seer Forward Pass
-        next_seer_carry, discrete_message, thought_vector = seer_apply_fn(
+        next_seer_carry, discrete_message, thought_vector, seer_nav_logits = seer_apply_fn(
             {"params": actor_params["seer"]},
             seer_carry,
             transition_step.global_obs,
@@ -72,45 +75,71 @@ def calculate_actor_losses(
             transition_step.proprioception,
             discrete_message
         )
-        return (next_seer_carry, next_doer_carry), (logits, discrete_message, thought_vector)
+        return (next_seer_carry, next_doer_carry), (
+            logits,
+            seer_nav_logits,
+            discrete_message,
+            thought_vector,
+        )
         
-    _, (logits, discrete_messages, thought_vectors) = jax.lax.scan(
+    _, (doer_logits, seer_nav_logits, discrete_messages, thought_vectors) = jax.lax.scan(
         scan_fn, 
         (init_seer_carry, init_doer_carry), 
         transition_batch
     )
-    
-    pi = distrax.Categorical(logits=logits)
-    new_log_probs = pi.log_prob(transition_batch.action)
-    entropy = pi.entropy().mean()
-    logratio = new_log_probs - transition_batch.log_prob
-    ratio = jnp.exp(logratio)
+
+    communication_mode = control_mode == 1
+    doer_pi = distrax.Categorical(logits=doer_logits)
+    seer_pi = distrax.Categorical(logits=seer_nav_logits)
+    doer_new_log_probs = doer_pi.log_prob(transition_batch.doer_action)
+    seer_nav_new_log_probs = seer_pi.log_prob(transition_batch.seer_action)
+    doer_entropy = doer_pi.entropy().mean()
+    seer_nav_entropy = seer_pi.entropy().mean()
 
     seer_adv = transition_batch.advantage[..., 0]
     doer_adv = transition_batch.advantage[..., 1]
     seer_adv = (seer_adv - seer_adv.mean()) / (seer_adv.std() + 1e-8)
     doer_adv = (doer_adv - doer_adv.mean()) / (doer_adv.std() + 1e-8)
 
-    seer_loss_unclipped = ratio * seer_adv
-    seer_loss_clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * seer_adv
+    seer_old_log_probs = jnp.where(
+        communication_mode,
+        transition_batch.doer_log_prob,
+        transition_batch.seer_log_prob,
+    )
+    seer_new_log_probs = jnp.where(
+        communication_mode,
+        doer_new_log_probs,
+        seer_nav_new_log_probs,
+    )
+    seer_logratio = seer_new_log_probs - seer_old_log_probs
+    seer_ratio = jnp.exp(seer_logratio)
+
+    seer_loss_unclipped = seer_ratio * seer_adv
+    seer_loss_clipped = jnp.clip(seer_ratio, 1.0 - clip_eps, 1.0 + clip_eps) * seer_adv
     seer_actor_loss = -jnp.minimum(seer_loss_unclipped, seer_loss_clipped).mean()
 
-    doer_loss_unclipped = ratio * doer_adv
-    doer_loss_clipped = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * doer_adv
+    doer_logratio = doer_new_log_probs - transition_batch.doer_log_prob
+    doer_ratio = jnp.exp(doer_logratio)
+    doer_loss_unclipped = doer_ratio * doer_adv
+    doer_loss_clipped = jnp.clip(doer_ratio, 1.0 - clip_eps, 1.0 + clip_eps) * doer_adv
     doer_actor_loss = -jnp.minimum(doer_loss_unclipped, doer_loss_clipped).mean()
+    doer_actor_loss = jnp.where(communication_mode, doer_actor_loss, 0.0)
 
     # Calculate aux metrics for information bottleneck auditing
     thought_variance = jnp.var(thought_vectors, axis=0).mean()
+    seer_bonus = jnp.where(communication_mode, thought_variance, seer_nav_entropy)
 
-    seer_loss = seer_actor_loss - seer_entropy_coef * thought_variance
-    doer_loss = doer_actor_loss - entropy_coef * entropy
+    seer_loss = seer_actor_loss - seer_entropy_coef * seer_bonus
+    doer_loss = doer_actor_loss - jnp.where(communication_mode, entropy_coef * doer_entropy, 0.0)
 
     return (seer_loss, doer_loss), {
         "seer_actor_loss": seer_actor_loss,
         "doer_actor_loss": doer_actor_loss,
-        "entropy": entropy,
-        "ratio": ratio.mean(),
+        "entropy": jnp.where(communication_mode, doer_entropy, seer_nav_entropy),
+        "seer_ratio": seer_ratio.mean(),
+        "doer_ratio": doer_ratio.mean(),
         "thought_variance": thought_variance,
+        "seer_nav_entropy": seer_nav_entropy,
         "discrete_messages": discrete_messages
     }
 
@@ -151,6 +180,7 @@ def update_actor(
     seer_apply_fn: Callable,
     doer_apply_fn: Callable,
     rng: jax.random.PRNGKey,
+    control_mode: jnp.ndarray,
     seer_entropy_coef: jnp.ndarray,
     num_ppo_epochs: int = 4,
     num_minibatches: int = 1
@@ -161,7 +191,7 @@ def update_actor(
     # Wait, the prompt says trajectory is (batch_size, seq_len, ...)
     # If the user scales num_envs later, batch_size = num_envs
     
-    batch_size = transition_batch.action.shape[0]
+    batch_size = transition_batch.doer_action.shape[0]
     minibatch_size = batch_size // num_minibatches
     
     def epoch_fn(carry, _):
@@ -195,6 +225,7 @@ def update_actor(
                     mb_transition_time_first,
                     mb_seer_carry,
                     mb_doer_carry,
+                    control_mode=control_mode,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return seer_loss, metrics
@@ -207,6 +238,7 @@ def update_actor(
                     mb_transition_time_first,
                     mb_seer_carry,
                     mb_doer_carry,
+                    control_mode=control_mode,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return doer_loss, metrics
@@ -232,11 +264,14 @@ def update_actor(
                 "seer_actor_loss": seer_metrics["seer_actor_loss"],
                 "doer_actor_loss": doer_metrics["doer_actor_loss"],
                 "entropy": doer_metrics["entropy"],
-                "ratio": doer_metrics["ratio"],
+                "seer_ratio": seer_metrics["seer_ratio"],
+                "doer_ratio": doer_metrics["doer_ratio"],
                 "thought_variance": seer_metrics["thought_variance"],
+                "seer_nav_entropy": seer_metrics["seer_nav_entropy"],
                 "discrete_messages": seer_metrics["discrete_messages"],
                 "seer_grad_norm": seer_grad_norm,
                 "doer_grad_norm": doer_grad_norm,
+                "actor_loss": seer_loss + doer_loss,
             }
             
             new_state = state.apply_gradients(grads=grads)
@@ -270,7 +305,7 @@ def update_critic(
     """Computes gradients and updates the critic network."""
     
     # For critic we can flatten the batch and sequence dimension since it's just MLPs
-    batch_size = transition_batch.action.shape[0] * transition_batch.action.shape[1]
+    batch_size = transition_batch.doer_action.shape[0] * transition_batch.doer_action.shape[1]
     flat_transition = jax.tree_util.tree_map(lambda x: x.reshape((batch_size,) + x.shape[2:]), transition_batch)
     minibatch_size = batch_size // num_minibatches
     

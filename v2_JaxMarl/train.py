@@ -46,6 +46,8 @@ def main():
         "cic_coef": 0.0,
         "doer_perception_level": 3,
         "curriculum_success_streak": 3,
+        "seer_pretraining_success_streak": 5,
+        "seer_eval_every": 10,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
@@ -71,12 +73,19 @@ def main():
         bump_penalty=config["bump_penalty"],
         doer_perception_level=config["doer_perception_level"],
     )
+    seer_nav_mode = jnp.array(env.SEER_NAV_PHASE, dtype=jnp.int32)
+    communication_mode = jnp.array(env.COMMUNICATION_PHASE, dtype=jnp.int32)
+    control_mode = seer_nav_mode
 
     # 4. Initial Environment Reset
     rng, env_rng = jax.random.split(rng, 2)
     reset_keys = jax.random.split(env_rng, config["num_envs"])
     # Give initial full vision radius of 3.0 for the 7x7 local crop
-    env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
+    env_obs, env_state = env.reset_batch(
+        reset_keys,
+        vision_radius=jnp.array(3.0),
+        control_mode=control_mode,
+    )
 
     # 5. Network Instantiation
     seer = Seer(fsq_levels=config["fsq_levels"])
@@ -133,7 +142,8 @@ def main():
         critic.apply,
         follow_reward_scale=config["follow_reward_scale"],
     )
-    success_streak = 0
+    communication_success_streak = 0
+    seer_mastery_streak = 0
 
     # 8. The Main Training Loop
     num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
@@ -161,13 +171,14 @@ def main():
             seer_carry,
             doer_carry,
             vision_radius,
+            control_mode,
             jnp.array(config["cic_coef"], dtype=jnp.float32),
             config["num_steps"],
             step_fn, critic.apply, doer.apply
         )
         
         # Extract for next loop iteration
-        params, seer_carry, doer_carry, env_state, env_obs, _, _ = final_runner_state
+        params, seer_carry, doer_carry, env_state, env_obs, _, _, _ = final_runner_state
         
         # B. Generalized Advantage Estimation (GAE)
         # GAE is now calculated inside generate_trajectory_and_gae
@@ -184,7 +195,7 @@ def main():
 
         actor_state, actor_metrics = update_actor(
             actor_state, batched_trajectory, batched_seer_carry, batched_doer_carry, 
-            seer.apply, doer.apply, actor_rng, seer_entropy_coef
+            seer.apply, doer.apply, actor_rng, control_mode, seer_entropy_coef
         )
         critic_state, critic_metrics = update_critic(
             critic_state, batched_trajectory, critic.apply, critic_rng
@@ -197,8 +208,10 @@ def main():
         
         # D. Logging
         if update % 10 == 0:
+            in_communication_phase = int(control_mode) == env.COMMUNICATION_PHASE
             wandb.log({
                 "update": update,
+                "training_phase": int(control_mode),
                 "actor_loss": actor_metrics.get("actor_loss", 0.0),
                 "entropy": actor_metrics.get("entropy", 0.0),
                 "critic_loss": critic_metrics.get("critic_loss", 0.0),
@@ -212,21 +225,26 @@ def main():
                 "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
                 "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
                 "thought_variance": actor_metrics.get("thought_variance", 0.0),
+                "seer_nav_entropy": actor_metrics.get("seer_nav_entropy", 0.0),
                 "vision_radius": vision_radius,
                 "seer_entropy_coef": seer_entropy_coef,
                 "doer_perception_level": config["doer_perception_level"],
-                "curriculum_success_streak": success_streak,
+                "seer_mastery_streak": seer_mastery_streak,
+                "curriculum_success_streak": communication_success_streak,
             })
-            rng, cic_rng = jax.random.split(rng)
-            cic_score = compute_cic(
-                doer.apply,
-                params["doer"],
-                trajectory_batch,
-                init_doer_carry,
-                cic_rng
-            )
+            cic_score = 0.0
+            if in_communication_phase:
+                rng, cic_rng = jax.random.split(rng)
+                cic_score = compute_cic(
+                    doer.apply,
+                    params["doer"],
+                    trajectory_batch,
+                    init_doer_carry,
+                    cic_rng
+                )
             print(
                 f"Update {update}/{num_updates} | "
+                f"Phase: {'communication' if in_communication_phase else 'seer_nav'} | "
                 f"Level: {config['doer_perception_level']} | "
                 f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
                 f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
@@ -248,7 +266,7 @@ def main():
                 print(f"Message sample: {flat_msgs[0:5]}")
 
         # E. Causal Influence of Communication and Heatmap logging
-        if update % 50 == 0:
+        if update % 50 == 0 and int(control_mode) == env.COMMUNICATION_PHASE:
 
             
             # Compute Heatmap
@@ -259,7 +277,7 @@ def main():
 
             m = np.rint(np.array(trajectory_batch.message)).astype(np.int32)
             m = np.clip(m, 0, levels - 1)
-            a = np.array(trajectory_batch.action)
+            a = np.array(trajectory_batch.doer_action)
             m_flat = (m * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
             a_flat = a.astype(np.int32).reshape(-1)
             
@@ -292,7 +310,49 @@ def main():
             
             
 
-        if update > 0 and update % config["visualize_every"] == 0:
+        if (
+            int(control_mode) == env.SEER_NAV_PHASE
+            and update > 0
+            and update % config["seer_eval_every"] == 0
+        ):
+            rng, viz_rng = jax.random.split(rng)
+            viz_path = Path(config["visualize_dir"]) / f"seer_nav_{update:05d}.gif"
+            _, solved = visualize_episode(
+                env,
+                params,
+                viz_rng,
+                seer,
+                doer,
+                filename=str(viz_path),
+                vision_radius=vision_radius,
+                max_steps=config["visualize_max_steps"],
+                control_mode=control_mode,
+            )
+            if solved:
+                seer_mastery_streak += 1
+            else:
+                seer_mastery_streak = 0
+
+            if seer_mastery_streak >= config["seer_pretraining_success_streak"]:
+                control_mode = communication_mode
+                communication_success_streak = 0
+
+                rng, env_rng = jax.random.split(rng, 2)
+                reset_keys = jax.random.split(env_rng, config["num_envs"])
+                env_obs, env_state = env.reset_batch(
+                    reset_keys,
+                    vision_radius=jnp.array(3.0),
+                    control_mode=control_mode,
+                )
+                seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                print("Seer navigation mastered; switching to communication-only training.")
+
+        if (
+            int(control_mode) == env.COMMUNICATION_PHASE
+            and update > 0
+            and update % config["visualize_every"] == 0
+        ):
             rng, viz_rng = jax.random.split(rng)
             viz_path = Path(config["visualize_dir"]) / f"episode_{update:05d}.gif"
             _, solved = visualize_episode(
@@ -304,30 +364,28 @@ def main():
                 filename=str(viz_path),
                 vision_radius=vision_radius,
                 max_steps=config["visualize_max_steps"],
+                control_mode=control_mode,
             )
             if solved:
-                success_streak += 1
+                communication_success_streak += 1
             else:
-                success_streak = 0
+                communication_success_streak = 0
 
             if (
-                success_streak >= config["curriculum_success_streak"]
+                communication_success_streak >= config["curriculum_success_streak"]
                 and config["doer_perception_level"] < 3
             ):
                 config["doer_perception_level"] += 1
-                success_streak = 0
+                communication_success_streak = 0
                 env.doer_perception_level = config["doer_perception_level"]
-                step_fn = make_rollout_step(
-                    env,
-                    seer.apply,
-                    doer.apply,
-                    critic.apply,
-                    follow_reward_scale=config["follow_reward_scale"],
-                )
 
                 rng, env_rng = jax.random.split(rng, 2)
                 reset_keys = jax.random.split(env_rng, config["num_envs"])
-                env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
+                env_obs, env_state = env.reset_batch(
+                    reset_keys,
+                    vision_radius=jnp.array(3.0),
+                    control_mode=control_mode,
+                )
                 seer_carry = seer.initialize_carry(config["num_envs"], 128)
                 doer_carry = doer.initialize_carry(config["num_envs"], 128)
                 print(
