@@ -72,20 +72,16 @@ def make_rollout_step(
         # 3. Action Selection
         seer_pi = distrax.Categorical(logits=seer_nav_logits)
         pi = distrax.Categorical(logits=action_logits)
-        null_pi = distrax.Categorical(logits=null_action_logits)
         seer_action = seer_pi.sample(seed=seer_rng)
         doer_action = pi.sample(seed=doer_rng)
         seer_log_prob = seer_pi.log_prob(seer_action)
         doer_log_prob = pi.log_prob(doer_action)
         env_action = jnp.where(communication_mode, doer_action, seer_action)
-        follow_reward = jnp.where(
-            communication_mode,
-            jnp.maximum(
-                pi.log_prob(doer_action) - null_pi.log_prob(doer_action),
-                0.0,
-            ) * follow_reward_scale,
-            jnp.asarray(0.0, dtype=jnp.float32),
-        )
+        message_action = jnp.argmax(action_logits, axis=-1)
+        null_message_action = jnp.argmax(null_action_logits, axis=-1)
+        action_change_bonus = (
+            message_action != null_message_action
+        ).astype(jnp.float32) * follow_reward_scale
         
         # 4. Critic Forward Pass (Centralized Training)
         # The critic evaluates the global state to guide learning[cite: 111].
@@ -107,6 +103,15 @@ def make_rollout_step(
         progress_reward = info["progress_reward"]
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
+        useful_communication = jnp.logical_or(
+            progress_reward > 0.0,
+            task_reward > 0.0,
+        )
+        follow_reward = jnp.where(
+            jnp.logical_and(communication_mode, useful_communication),
+            action_change_bonus,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         shared_comm_reward = (
             task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
         )
