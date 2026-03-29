@@ -63,6 +63,8 @@ class Seer(nn.Module):
             features=len(self.fsq_levels),
             kernel_init=nn.initializers.orthogonal(scale=2.0)
         )(lstm_out)
+        # Clamp to prevent thought_vector explosion
+        thought_vector = jnp.clip(thought_vector, -5.0, 5.0)
         
         # 6. Output Head: FSQ Discretizer 
         # Transforms the continuous thought vector into the discrete message $m_t$ 

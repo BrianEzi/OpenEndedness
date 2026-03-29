@@ -16,7 +16,7 @@ from eval.metrics import compute_cic
 from eval.visualize import visualize_episode
 import numpy as np
 import wandb
-
+import pickle
 
 # For the sake of a complete script, here is a pragmatic, standard Critic
 class GlobalCritic(nn.Module):
@@ -34,17 +34,18 @@ class GlobalCritic(nn.Module):
 def main():
     # 1. Configuration and Logging
     config = {
-        "learning_rate": 3e-4,
+        "seer_learning_rate": 2e-4,
+        "doer_learning_rate": 3e-4,
         "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 10_000_000,
-        "env_id": "Navix-Empty-8x8-v0",
+        "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [4], # Defines the categorical hypercube
         "seed": 42,
-        "follow_reward_scale": 0.1,
+        "follow_reward_scale": 0.3,
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
-        "doer_perception_level": 3,
+        "doer_perception_level": 0,
         "curriculum_success_streak": 3,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
@@ -52,6 +53,8 @@ def main():
         "visualize_every": 400,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
+        "seer_solo_checkpoint": "artifacts/checkpoints/seer_solo_final.pkl",
+        "msg_diversity_scale": 0.1,
     }
     
     wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
@@ -98,6 +101,19 @@ def main():
     doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
     critic_params = critic.init(critic_init_rng, dummy_map)["params"]
 
+    _ckpt_path = Path(config["seer_solo_checkpoint"])
+    if _ckpt_path.exists():
+        with open(_ckpt_path, "rb") as f:
+            solo_params = pickle.load(f)
+        keys_to_transfer = ["Conv_0", "Conv_1", "Dense_0", "LSTMCell_0"]
+        seer_params = dict(seer_params)
+        for k in keys_to_transfer:
+            seer_params[k] = solo_params[k]
+        print(f"Transferred SeerSolo weights: {keys_to_transfer}")
+    else:
+        print("Warning: SeerSolo checkpoint not found, using random init.")
+
+
     seer_carry = seer.initialize_carry(config["num_envs"], 128)
     doer_carry = doer.initialize_carry(config["num_envs"], 128)
 
@@ -105,25 +121,35 @@ def main():
     params = {"seer": seer_params, "doer": doer_params, "critic": critic_params}
 
     # 6. Optimizer and TrainState Setup
-    # Optax provides the gradient transformation tools
-    tx = optax.chain(
-        optax.clip_by_global_norm(0.5),
-        optax.adam(learning_rate=config["learning_rate"], eps=1e-5)
+    # Separate learning rates for Seer and Doer to prevent Seer gradient explosion
+    tx = optax.multi_transform(
+        {
+            'seer': optax.chain(
+                optax.clip_by_global_norm(0.5),
+                optax.adam(learning_rate=config["seer_learning_rate"], eps=1e-5)
+            ),
+            'doer': optax.chain(
+                optax.clip_by_global_norm(0.5),
+                optax.adam(learning_rate=config["doer_learning_rate"], eps=1e-5)
+            ),
+        },
+        param_labels=lambda params: {k: k for k in params}
     )
 
-    # Since the Seer and Doer act cooperatively to generate the trajectory,
-    # we can conceptually treat them as a single "Actor" policy for the optimizer.
-    # In a more advanced setup, you might give them separate optimizers.
     actor_state = TrainState.create(
-        apply_fn=None, # We use specific apply fns in the update step
+        apply_fn=None,
         params={"seer": seer_params, "doer": doer_params},
         tx=tx
     )
     
+    tx_critic = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adam(learning_rate=config["doer_learning_rate"], eps=1e-5)
+    )
     critic_state = TrainState.create(
         apply_fn=critic.apply,
         params=critic_params,
-        tx=tx
+        tx=tx_critic
     )
 
     step_fn = make_rollout_step(
@@ -132,7 +158,9 @@ def main():
         doer.apply,
         critic.apply,
         follow_reward_scale=config["follow_reward_scale"],
+        msg_diversity_scale=config["msg_diversity_scale"],
     )
+
     success_streak = 0
 
     # 8. The Main Training Loop
@@ -147,7 +175,7 @@ def main():
         
         # Curriculums
         vision_radius = jnp.clip(3.0 - 2.0 * (update / 1000.0), 1.0, 3.0)
-        seer_entropy_coef = jnp.clip(0.1 - 0.09 * (update / 1000.0), 0.01, 0.1)
+        seer_entropy_coef = jnp.clip(0.1 - 0.05 * (update / 1000.0), 0.05, 0.1)
         
         # A. Collect Trajectory
         init_seer_carry = seer_carry
@@ -323,8 +351,8 @@ def main():
                     doer.apply,
                     critic.apply,
                     follow_reward_scale=config["follow_reward_scale"],
+                    msg_diversity_scale=config["msg_diversity_scale"],
                 )
-
                 rng, env_rng = jax.random.split(rng, 2)
                 reset_keys = jax.random.split(env_rng, config["num_envs"])
                 env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))

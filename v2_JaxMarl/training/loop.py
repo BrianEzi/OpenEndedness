@@ -7,13 +7,13 @@ from training.gae import compute_gae
 # Assuming Transition is imported from your mappo.py or a shared datatypes file
 from agents.mappo import Transition 
 from eval.metrics import compute_cic
-
 def make_rollout_step(
     env,
     seer_apply_fn,
     doer_apply_fn,
     critic_apply_fn,
     follow_reward_scale=0.1,
+    msg_diversity_scale=0.05,
 ):
     """
     A closure that returns the JAX-compilable step function.
@@ -21,6 +21,7 @@ def make_rollout_step(
     repeatedly into the compiled loop.
     """
     follow_reward_scale = jnp.asarray(follow_reward_scale, dtype=jnp.float32)
+    msg_diversity_scale = jnp.asarray(msg_diversity_scale, dtype=jnp.float32)
     
     def rollout_step(runner_state: Tuple, _):
         """
@@ -73,18 +74,17 @@ def make_rollout_step(
         null_pi = distrax.Categorical(logits=null_action_logits)
         action = pi.sample(seed=doer_rng)
         log_prob = pi.log_prob(action)
-        follow_reward = jnp.maximum(
-            pi.log_prob(action) - null_pi.log_prob(action),
-            0.0,
-        ) * follow_reward_scale
-        
+        action_with_msg = jnp.argmax(action_logits, axis=-1)
+        action_without_msg = jnp.argmax(null_action_logits, axis=-1)
+        action_changed = (action_with_msg != action_without_msg).astype(jnp.float32)
+
         # 4. Critic Forward Pass (Centralized Training)
         # The critic evaluates the global state to guide learning[cite: 111].
         value = critic_apply_fn({"params": params["critic"]}, global_map)
-        
+
         # 5. Environment Step
         # Step the jaxmarl environment using the chosen action
-        # Note: jaxmarl expects a dictionary of actions for multi-agent, 
+        # Note: jaxmarl expects a dictionary of actions for multi-agent,
         # adapt this based on your specific wrapper implementation.
         next_env_obs, next_env_state, reward, done, info = env.step_batch(
             env_step_keys, env_state, action, vision_radius=vision_radius
@@ -94,7 +94,10 @@ def make_rollout_step(
         progress_reward = info["progress_reward"]
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
-        seer_reward = task_reward + progress_reward - step_penalty
+        msg_diversity = jnp.std(discrete_message) * msg_diversity_scale
+        useful = jnp.where(progress_reward > 0, 1.0, 0.0)
+        follow_reward = action_changed * useful * follow_reward_scale
+        seer_reward = task_reward + progress_reward - step_penalty + msg_diversity
         doer_reward = task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
         reward = jnp.stack([seer_reward, doer_reward], axis=-1)
 
