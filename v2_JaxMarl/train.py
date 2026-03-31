@@ -82,6 +82,79 @@ def sample_curriculum_anchor(
     )
 
 
+def collect_message_action_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    action_labels = ("turn_left", "turn_right", "forward")
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(
+        reset_rng,
+        vision_radius=vision_radius,
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    trace_lines = []
+    done = False
+    step_count = 0
+
+    while not bool(done) and step_count < max_steps:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_view = obs["local_view"][None, ...]
+        proprioception = obs["proprioception"][None, ...]
+
+        seer_carry, message, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+        )
+        doer_carry, action_logits = doer.apply(
+            {"params": params["doer"]},
+            doer_carry,
+            local_view,
+            proprioception,
+            message,
+        )
+
+        message_np = np.asarray(message[0]).round(3).tolist()
+        action = int(jnp.argmax(action_logits[0]))
+        action_label = action_labels[action] if action < len(action_labels) else str(action)
+        player_position = np.asarray(env.player_position(state)).tolist()
+        trace_lines.append(
+            f"t={step_count:02d} pos={player_position} msg={message_np} action={action_label}"
+        )
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            jnp.asarray(action, dtype=jnp.int32),
+            vision_radius=vision_radius,
+            control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
+        )
+        step_count += 1
+
+    final_status = "solved" if bool(done) and float(info["task_reward"]) > 0.0 else "stopped"
+    trace_lines.append(f"end={final_status} steps={step_count}")
+    return rng, trace_lines
+
+
 def main():
     # 1. Configuration and Logging
     config = {
@@ -103,10 +176,12 @@ def main():
         "seer_mastery_success_rate": 0.8,
         "communication_mastery_success_rate": 0.75,
         "communication_mastery_cic_floor": 0.1,
+        "release_goal_after_max_level": True,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
         "visualize_every": 400,
+        "message_trace_every": 100,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
     }
@@ -210,6 +285,7 @@ def main():
     current_start_success_streak = 0
     seer_mastered_starts = 0
     communication_mastered_starts = 0
+    goal_randomization_enabled = False
 
     # 8. The Main Training Loop
     num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
@@ -290,9 +366,16 @@ def main():
         # D. Logging
         if update % 10 == 0:
             in_communication_phase = int(control_mode) == env.COMMUNICATION_PHASE
+            if int(control_mode) == env.SEER_NAV_PHASE:
+                phase_label = "seer_nav"
+            elif goal_randomization_enabled:
+                phase_label = "communication_random_full"
+            else:
+                phase_label = "communication_random_start"
             wandb.log({
                 "update": update,
                 "training_phase": int(control_mode),
+                "phase_label": phase_label,
                 "actor_loss": actor_metrics.get("actor_loss", 0.0),
                 "entropy": actor_metrics.get("entropy", 0.0),
                 "critic_loss": critic_metrics.get("critic_loss", 0.0),
@@ -315,6 +398,7 @@ def main():
                 "communication_mastered_starts": communication_mastered_starts,
                 "rollout_success_rate": rollout_success_rate,
                 "rollout_num_successes": rollout_num_successes,
+                "goal_randomization_enabled": int(goal_randomization_enabled),
                 "fixed_goal_row": fixed_goal_position[0],
                 "fixed_goal_col": fixed_goal_position[1],
                 "fixed_start_row": fixed_start_position[0],
@@ -329,10 +413,10 @@ def main():
                     trajectory_batch,
                     init_doer_carry,
                     cic_rng
-                )
+            )
             print(
                 f"Update {update}/{num_updates} | "
-                f"Phase: {'communication' if in_communication_phase else 'seer_nav'} | "
+                f"Phase: {phase_label} | "
                 f"Level: {config['doer_perception_level']} | "
                 f"Start: ({int(fixed_start_position[0])}, {int(fixed_start_position[1])}) | "
                 f"Goal: ({int(fixed_goal_position[0])}, {int(fixed_goal_position[1])}) | "
@@ -350,12 +434,26 @@ def main():
                 f"CIC: {cic_score:.3f}"
             )
             
-            # Log a small sample of the discrete messages to see distribution
-            sample_msgs = actor_metrics.get("discrete_messages")
-            if sample_msgs is not None:
-                # Shape might be flattened over sequence and batch. Let's just print the first 5 elements safely.
-                flat_msgs = sample_msgs.reshape((-1, len(config["fsq_levels"])))
-                print(f"Message sample: {flat_msgs[0:5]}")
+            if (
+                in_communication_phase
+                and update % config["message_trace_every"] == 0
+            ):
+                rng, trace_rng = jax.random.split(rng)
+                rng, trace_lines = collect_message_action_trace(
+                    env,
+                    params,
+                    trace_rng,
+                    seer,
+                    doer,
+                    vision_radius,
+                    config["visualize_max_steps"],
+                    control_mode,
+                    fixed_goal_position,
+                    fixed_start_position,
+                )
+                print("Communication trace:")
+                for line in trace_lines:
+                    print(line)
 
         # E. Causal Influence of Communication and Heatmap logging
         if update % 50 == 0 and int(control_mode) == env.COMMUNICATION_PHASE:
@@ -404,7 +502,12 @@ def main():
 
         if update > 0 and update % config["visualize_every"] == 0:
             rng, viz_rng = jax.random.split(rng)
-            prefix = "seer_nav" if int(control_mode) == env.SEER_NAV_PHASE else "communication"
+            if int(control_mode) == env.SEER_NAV_PHASE:
+                prefix = "seer_nav"
+            elif goal_randomization_enabled:
+                prefix = "communication_random_full"
+            else:
+                prefix = "communication_random_start"
             viz_path = Path(config["visualize_dir"]) / f"{prefix}_{update:05d}.gif"
             visualize_episode(
                 env,
@@ -432,7 +535,7 @@ def main():
 
                 if seer_mastered_starts >= config["seer_required_start_positions"]:
                     control_mode = communication_mode
-                    config["doer_perception_level"] = 1
+                    config["doer_perception_level"] = 2
                     env.doer_perception_level = config["doer_perception_level"]
                     communication_mastered_starts = 0
                     print("Seer navigation mastered on five starts; switching to communication phase.")
@@ -486,16 +589,36 @@ def main():
                             f"{config['doer_perception_level']}"
                         )
                     else:
-                        print("Max doer perception level reached; continuing with new starts.")
+                        if (
+                            config["release_goal_after_max_level"]
+                            and not goal_randomization_enabled
+                        ):
+                            goal_randomization_enabled = True
+                            fixed_goal_position = UNSET_POSITION
+                            fixed_start_position = UNSET_POSITION
+                            print(
+                                "Max doer perception level mastered; releasing fixed goal "
+                                "and continuing in fully random Empty-Random-8x8."
+                            )
+                        else:
+                            print("Max doer perception level reached; continuing with new starts.")
 
-                rng, _, fixed_start_position = sample_curriculum_anchor(
-                    env,
-                    rng,
-                    vision_radius,
-                    control_mode,
-                    fixed_goal_position=fixed_goal_position,
-                    exclude_start_position=fixed_start_position,
-                )
+                if goal_randomization_enabled:
+                    rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
+                        env,
+                        rng,
+                        vision_radius,
+                        control_mode,
+                    )
+                else:
+                    rng, _, fixed_start_position = sample_curriculum_anchor(
+                        env,
+                        rng,
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position=fixed_goal_position,
+                        exclude_start_position=fixed_start_position,
+                    )
                 rng, env_obs, env_state = reset_curriculum_batch(
                     env,
                     rng,
