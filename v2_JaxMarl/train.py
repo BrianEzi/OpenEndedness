@@ -75,76 +75,12 @@ def sample_curriculum_anchor(
             jnp.all(start_position == exclude_start_position)
         ):
             return rng, env.goal_position(timestep), start_position
-    raise RuntimeError("Failed to sample a new curriculum start position.")
-
-
-def evaluate_curriculum_episode(
-    env,
-    params,
-    rng,
-    seer,
-    doer,
-    vision_radius,
-    max_steps,
-    control_mode,
-    fixed_goal_position,
-    fixed_start_position,
-):
-    rng, reset_rng = jax.random.split(rng)
-    obs, state = env.reset(
-        reset_rng,
-        vision_radius=vision_radius,
-        control_mode=control_mode,
-        fixed_goal_position=fixed_goal_position,
-        fixed_start_position=fixed_start_position,
+    raise RuntimeError(
+        "Failed to sample a new curriculum start position. "
+        "This curriculum requires an environment with random starts, "
+        "for example 'Navix-Empty-Random-8x8-v0'."
     )
 
-    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
-    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
-
-    done = False
-    step_count = 0
-    solved = False
-
-    while not bool(done) and step_count < max_steps:
-        global_map = obs["global_map"][None, ...]
-        symbolic_state = obs["symbolic_state"][None, ...]
-        local_view = obs["local_view"][None, ...]
-        proprioception = obs["proprioception"][None, ...]
-
-        seer_carry, message, _, seer_nav_logits = seer.apply(
-            {"params": params["seer"]},
-            seer_carry,
-            global_map,
-            symbolic_state,
-        )
-
-        if int(control_mode) == env.SEER_NAV_PHASE:
-            action = jnp.argmax(seer_nav_logits[0]).astype(jnp.int32)
-        else:
-            doer_carry, action_logits = doer.apply(
-                {"params": params["doer"]},
-                doer_carry,
-                local_view,
-                proprioception,
-                message,
-            )
-            action = jnp.argmax(action_logits[0]).astype(jnp.int32)
-
-        rng, step_rng = jax.random.split(rng)
-        obs, state, _, done, info = env.step(
-            step_rng,
-            state,
-            action,
-            vision_radius=vision_radius,
-            control_mode=control_mode,
-            fixed_goal_position=fixed_goal_position,
-            fixed_start_position=fixed_start_position,
-        )
-        solved = solved or bool(done) and float(info["task_reward"]) > 0.0
-        step_count += 1
-
-    return rng, solved
 
 def main():
     # 1. Configuration and Logging
@@ -153,7 +89,7 @@ def main():
         "num_envs": 16,
         "num_steps": 128,
         "total_timesteps": 10_000_000,
-        "env_id": "Navix-Empty-8x8-v0",
+        "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [4], # Defines the categorical hypercube
         "seed": 42,
         "follow_reward_scale": 0.1,
@@ -164,8 +100,9 @@ def main():
         "curriculum_success_streak": 3,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
-        "seer_eval_every": 10,
-        "communication_eval_every": 10,
+        "seer_mastery_success_rate": 0.8,
+        "communication_mastery_success_rate": 0.75,
+        "communication_mastery_cic_floor": 0.1,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
@@ -336,6 +273,13 @@ def main():
         params["seer"] = actor_state.params["seer"]
         params["doer"] = actor_state.params["doer"]
         params["critic"] = critic_state.params
+
+        success_events = jnp.logical_and(
+            trajectory_batch.done,
+            trajectory_batch.task_reward > 0.0,
+        )
+        rollout_success_rate = success_events.astype(jnp.float32).mean()
+        rollout_num_successes = success_events.astype(jnp.int32).sum()
         
         # D. Logging
         if update % 10 == 0:
@@ -363,6 +307,8 @@ def main():
                 "current_start_success_streak": current_start_success_streak,
                 "seer_mastered_starts": seer_mastered_starts,
                 "communication_mastered_starts": communication_mastered_starts,
+                "rollout_success_rate": rollout_success_rate,
+                "rollout_num_successes": rollout_num_successes,
                 "fixed_goal_row": fixed_goal_position[0],
                 "fixed_goal_col": fixed_goal_position[1],
                 "fixed_start_row": fixed_start_position[0],
@@ -385,6 +331,7 @@ def main():
                 f"Start: ({int(fixed_start_position[0])}, {int(fixed_start_position[1])}) | "
                 f"Goal: ({int(fixed_goal_position[0])}, {int(fixed_goal_position[1])}) | "
                 f"Streak: {current_start_success_streak} | "
+                f"SuccessRate: {float(rollout_success_rate):.3f} | "
                 f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
                 f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
                 f"Task: {trajectory_batch.task_reward.mean():.3f} | "
@@ -467,24 +414,11 @@ def main():
                 fixed_start_position=fixed_start_position,
             )
 
-        if (
-            int(control_mode) == env.SEER_NAV_PHASE
-            and update > 0
-            and update % config["seer_eval_every"] == 0
-        ):
-            rng, solved = evaluate_curriculum_episode(
-                env,
-                params,
-                rng,
-                seer,
-                doer,
-                vision_radius,
-                config["visualize_max_steps"],
-                control_mode,
-                fixed_goal_position,
-                fixed_start_position,
+        if int(control_mode) == env.SEER_NAV_PHASE:
+            mastered_current_start = (
+                float(rollout_success_rate) >= config["seer_mastery_success_rate"]
             )
-            current_start_success_streak = current_start_success_streak + 1 if solved else 0
+            current_start_success_streak = current_start_success_streak + 1 if mastered_current_start else 0
 
             if current_start_success_streak >= config["curriculum_success_streak"]:
                 current_start_success_streak = 0
@@ -522,24 +456,12 @@ def main():
                 seer_carry = seer.initialize_carry(config["num_envs"], 128)
                 doer_carry = doer.initialize_carry(config["num_envs"], 128)
 
-        if (
-            int(control_mode) == env.COMMUNICATION_PHASE
-            and update > 0
-            and update % config["communication_eval_every"] == 0
-        ):
-            rng, solved = evaluate_curriculum_episode(
-                env,
-                params,
-                rng,
-                seer,
-                doer,
-                vision_radius,
-                config["visualize_max_steps"],
-                control_mode,
-                fixed_goal_position,
-                fixed_start_position,
+        if int(control_mode) == env.COMMUNICATION_PHASE:
+            mastered_current_start = (
+                float(rollout_success_rate) >= config["communication_mastery_success_rate"]
+                and float(cic_score) >= config["communication_mastery_cic_floor"]
             )
-            current_start_success_streak = current_start_success_streak + 1 if solved else 0
+            current_start_success_streak = current_start_success_streak + 1 if mastered_current_start else 0
 
             if current_start_success_streak >= config["curriculum_success_streak"]:
                 current_start_success_streak = 0

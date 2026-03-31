@@ -48,6 +48,31 @@ class NavixGridWrapper:
             jnp.all(actual_position == target_position),
         )
 
+    def _apply_curriculum_positions(
+        self,
+        timestep,
+        fixed_goal_position: jnp.ndarray,
+        fixed_start_position: jnp.ndarray,
+    ):
+        state = timestep.state
+
+        if jnp.all(fixed_goal_position >= 0):
+            goals = state.get_goals()
+            updated_goal_positions = goals.position.at[0].set(
+                fixed_goal_position.astype(goals.position.dtype)
+            )
+            state = state.set_goals(goals.replace(position=updated_goal_positions))
+
+        if jnp.all(fixed_start_position >= 0):
+            player = state.get_player()
+            state = state.set_player(
+                player.replace(
+                    position=fixed_start_position.astype(player.position.dtype)
+                )
+            )
+
+        return timestep.replace(state=state)
+
     def _split_observations(
         self,
         timestep,
@@ -140,27 +165,27 @@ class NavixGridWrapper:
         fixed_start_position: jnp.ndarray = UNSET_POSITION,
     ):
         timestep = self._env.reset(key)
+        timestep = self._apply_curriculum_positions(
+            timestep,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
+        )
+
         distance = self._goal_distance(timestep.state)
 
-        def matches_curriculum(sampled_timestep, goal_distance):
-            player_position = self.player_position(sampled_timestep)
-            goal_position = self.goal_position(sampled_timestep)
-            return jnp.logical_and(
-                goal_distance >= self.min_start_distance,
-                jnp.logical_and(
-                    self._position_matches(goal_position, fixed_goal_position),
-                    self._position_matches(player_position, fixed_start_position),
-                ),
-            )
-
         def cond_fn(carry):
-            _, sampled_timestep, goal_distance = carry
-            return jnp.logical_not(matches_curriculum(sampled_timestep, goal_distance))
+            _, _, goal_distance = carry
+            return goal_distance < self.min_start_distance
 
         def body_fn(carry):
             rng, _, _ = carry
             rng, sample_key = jax.random.split(rng)
             sampled_timestep = self._env.reset(sample_key)
+            sampled_timestep = self._apply_curriculum_positions(
+                sampled_timestep,
+                fixed_goal_position=fixed_goal_position,
+                fixed_start_position=fixed_start_position,
+            )
             goal_distance = self._goal_distance(sampled_timestep.state)
             return rng, sampled_timestep, goal_distance
 
