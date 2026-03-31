@@ -54,22 +54,33 @@ class NavixGridWrapper:
         fixed_goal_position: jnp.ndarray,
         fixed_start_position: jnp.ndarray,
     ):
-        state = timestep.state
-
-        if jnp.all(fixed_goal_position >= 0):
+        def set_goal(state):
             goals = state.get_goals()
             updated_goal_positions = goals.position.at[0].set(
                 fixed_goal_position.astype(goals.position.dtype)
             )
-            state = state.set_goals(goals.replace(position=updated_goal_positions))
+            return state.set_goals(goals.replace(position=updated_goal_positions))
 
-        if jnp.all(fixed_start_position >= 0):
+        def set_start(state):
             player = state.get_player()
-            state = state.set_player(
+            return state.set_player(
                 player.replace(
                     position=fixed_start_position.astype(player.position.dtype)
                 )
             )
+
+        state = jax.lax.cond(
+            jnp.all(fixed_goal_position >= 0),
+            set_goal,
+            lambda state: state,
+            timestep.state,
+        )
+        state = jax.lax.cond(
+            jnp.all(fixed_start_position >= 0),
+            set_start,
+            lambda state: state,
+            state,
+        )
 
         return timestep.replace(state=state)
 
