@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 from navix import observations
 
+UNSET_POSITION = jnp.array([-1, -1], dtype=jnp.int32)
+
 
 class NavixGridWrapper:
     """Expose Navix single-agent environments with the Seer/Doer observation split."""
@@ -30,6 +32,21 @@ class NavixGridWrapper:
     def num_actions(self) -> int:
         # Navigation-only action space: turn left, turn right, move forward.
         return 3
+
+    @staticmethod
+    def player_position(timestep) -> jnp.ndarray:
+        return timestep.state.get_player().position.astype(jnp.int32)
+
+    @staticmethod
+    def goal_position(timestep) -> jnp.ndarray:
+        return timestep.state.get_goals().position[0].astype(jnp.int32)
+
+    @staticmethod
+    def _position_matches(actual_position: jnp.ndarray, target_position: jnp.ndarray) -> jnp.ndarray:
+        return jnp.logical_or(
+            jnp.any(target_position < 0),
+            jnp.all(actual_position == target_position),
+        )
 
     def _split_observations(
         self,
@@ -119,13 +136,26 @@ class NavixGridWrapper:
         key: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
         control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+        fixed_goal_position: jnp.ndarray = UNSET_POSITION,
+        fixed_start_position: jnp.ndarray = UNSET_POSITION,
     ):
         timestep = self._env.reset(key)
         distance = self._goal_distance(timestep.state)
 
+        def matches_curriculum(sampled_timestep, goal_distance):
+            player_position = self.player_position(sampled_timestep)
+            goal_position = self.goal_position(sampled_timestep)
+            return jnp.logical_and(
+                goal_distance >= self.min_start_distance,
+                jnp.logical_and(
+                    self._position_matches(goal_position, fixed_goal_position),
+                    self._position_matches(player_position, fixed_start_position),
+                ),
+            )
+
         def cond_fn(carry):
-            _, _, goal_distance = carry
-            return goal_distance < self.min_start_distance
+            _, sampled_timestep, goal_distance = carry
+            return jnp.logical_not(matches_curriculum(sampled_timestep, goal_distance))
 
         def body_fn(carry):
             rng, _, _ = carry
@@ -147,8 +177,16 @@ class NavixGridWrapper:
         keys: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
         control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+        fixed_goal_position: jnp.ndarray = UNSET_POSITION,
+        fixed_start_position: jnp.ndarray = UNSET_POSITION,
     ):
-        return jax.vmap(self.reset, in_axes=(0, None, None))(keys, vision_radius, control_mode)
+        return jax.vmap(self.reset, in_axes=(0, None, None, None, None))(
+            keys,
+            vision_radius,
+            control_mode,
+            fixed_goal_position,
+            fixed_start_position,
+        )
 
     def step(
         self,
@@ -157,12 +195,16 @@ class NavixGridWrapper:
         action: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
         control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+        fixed_goal_position: jnp.ndarray = UNSET_POSITION,
+        fixed_start_position: jnp.ndarray = UNSET_POSITION,
     ):
         def reset_branch(_):
             reset_obs, reset_timestep = self.reset(
                 key,
                 vision_radius=vision_radius,
                 control_mode=control_mode,
+                fixed_goal_position=fixed_goal_position,
+                fixed_start_position=fixed_start_position,
             )
             reward = jnp.asarray(0.0, dtype=jnp.float32)
             done = jnp.asarray(False)
@@ -214,13 +256,17 @@ class NavixGridWrapper:
         actions: jnp.ndarray,
         vision_radius: jnp.ndarray = jnp.array(3.0),
         control_mode: jnp.ndarray = jnp.array(COMMUNICATION_PHASE),
+        fixed_goal_position: jnp.ndarray = UNSET_POSITION,
+        fixed_start_position: jnp.ndarray = UNSET_POSITION,
     ):
-        return jax.vmap(self.step, in_axes=(0, 0, 0, None, None))(
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None, None, None, None))(
             keys,
             timesteps,
             actions,
             vision_radius,
             control_mode,
+            fixed_goal_position,
+            fixed_start_position,
         )
 
     def render(

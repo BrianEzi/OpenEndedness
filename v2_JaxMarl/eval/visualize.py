@@ -4,6 +4,8 @@ import jax
 import jax.numpy as jnp
 from PIL import Image
 
+from envs.navix_wrapper import UNSET_POSITION
+
 
 def visualize_episode(
     env,
@@ -15,6 +17,8 @@ def visualize_episode(
     vision_radius=jnp.array(2.0),
     max_steps=200,
     control_mode=jnp.array(1, dtype=jnp.int32),
+    fixed_goal_position=UNSET_POSITION,
+    fixed_start_position=UNSET_POSITION,
 ):
     """Run one greedy evaluation episode and save it as a GIF."""
     frames = []
@@ -26,6 +30,8 @@ def visualize_episode(
         reset_rng,
         vision_radius=vision_radius,
         control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
     )
 
     seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
@@ -70,6 +76,8 @@ def visualize_episode(
             action,
             vision_radius=vision_radius,
             control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
         )
         solved = solved or bool(done) and float(info["task_reward"]) > 0.0
 

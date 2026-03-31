@@ -28,7 +28,18 @@ def make_rollout_step(
         Designed to be passed directly to jax.lax.scan.
         """
         # Unpack the runner state
-        params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius, control_mode = runner_state
+        (
+            params,
+            seer_carry,
+            doer_carry,
+            env_state,
+            env_obs,
+            rng,
+            vision_radius,
+            control_mode,
+            fixed_goal_position,
+            fixed_start_position,
+        ) = runner_state
         num_envs = env_obs["global_map"].shape[0]
         communication_mode = control_mode == 1
         
@@ -97,6 +108,8 @@ def make_rollout_step(
             env_action,
             vision_radius=vision_radius,
             control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
         )
 
         task_reward = info["task_reward"]
@@ -171,6 +184,8 @@ def make_rollout_step(
             rng,
             vision_radius,
             control_mode,
+            fixed_goal_position,
+            fixed_start_position,
         )
         
         return next_runner_state, transition
@@ -181,7 +196,7 @@ import functools
 
 @functools.partial(jax.jit, static_argnames=("num_steps", "step_fn", "critic_apply_fn", "doer_apply_fn"))
 def generate_trajectory_and_gae(
-    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, control_mode: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
+    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, control_mode: jnp.ndarray, fixed_goal_position: jnp.ndarray, fixed_start_position: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
     step_fn, critic_apply_fn, doer_apply_fn
 ):
     """
@@ -198,6 +213,8 @@ def generate_trajectory_and_gae(
         rng,
         vision_radius,
         control_mode,
+        fixed_goal_position,
+        fixed_start_position,
     )
     
     # 1. Execute the scan loop to collect the raw trajectory
@@ -207,7 +224,7 @@ def generate_trajectory_and_gae(
     
     # 2. Extract the final state for Critic bootstrapping
     # Unpack the final runner state to get the last env_obs
-    _, _, _, _, final_env_obs, _, _, _ = final_runner_state
+    _, _, _, _, final_env_obs, _, _, _, _, _ = final_runner_state
     
     # Enforce CTDE: The critic evaluates the global map 
     final_global_map = final_env_obs["global_map"]
