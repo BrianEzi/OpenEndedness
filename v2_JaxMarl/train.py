@@ -278,8 +278,14 @@ def main():
             trajectory_batch.done,
             trajectory_batch.task_reward > 0.0,
         )
-        rollout_success_rate = success_events.astype(jnp.float32).mean()
+        completed_episodes = trajectory_batch.done.astype(jnp.int32).sum()
         rollout_num_successes = success_events.astype(jnp.int32).sum()
+        rollout_success_rate = jnp.where(
+            completed_episodes > 0,
+            rollout_num_successes.astype(jnp.float32)
+            / completed_episodes.astype(jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         
         # D. Logging
         if update % 10 == 0:
