@@ -155,6 +155,74 @@ def collect_message_action_trace(
     return rng, trace_lines
 
 
+def evaluate_greedy_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(
+        reset_rng,
+        vision_radius=vision_radius,
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    done = False
+    step_count = 0
+    solved = False
+
+    while not bool(done) and step_count < max_steps:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_view = obs["local_view"][None, ...]
+        proprioception = obs["proprioception"][None, ...]
+
+        seer_carry, message, _, seer_nav_logits = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+        )
+
+        if int(control_mode) == env.SEER_NAV_PHASE:
+            action = jnp.argmax(seer_nav_logits[0]).astype(jnp.int32)
+        else:
+            doer_carry, action_logits = doer.apply(
+                {"params": params["doer"]},
+                doer_carry,
+                local_view,
+                proprioception,
+                message,
+            )
+            action = jnp.argmax(action_logits[0]).astype(jnp.int32)
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            action,
+            vision_radius=vision_radius,
+            control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
+        )
+        solved = solved or bool(done) and float(info["task_reward"]) > 0.0
+        step_count += 1
+
+    return rng, solved
+
+
 def main():
     # 1. Configuration and Logging
     config = {
@@ -168,14 +236,12 @@ def main():
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
-        "doer_perception_level": 1,
+        "doer_perception_level": 2,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
+        "curriculum_eval_every": 25,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
-        "seer_mastery_success_rate": 0.8,
-        "communication_mastery_success_rate": 0.75,
-        "communication_mastery_cic_floor": 0.1,
         "release_goal_after_max_level": True,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
@@ -523,94 +589,37 @@ def main():
                 fixed_start_position=fixed_start_position,
             )
 
-        if int(control_mode) == env.SEER_NAV_PHASE:
-            mastered_current_start = (
-                float(rollout_success_rate) >= config["seer_mastery_success_rate"]
+        if update > 0 and update % config["curriculum_eval_every"] == 0:
+            rng, greedy_solved = evaluate_greedy_episode(
+                env,
+                params,
+                rng,
+                seer,
+                doer,
+                vision_radius,
+                config["visualize_max_steps"],
+                control_mode,
+                fixed_goal_position,
+                fixed_start_position,
             )
-            current_start_success_streak = current_start_success_streak + 1 if mastered_current_start else 0
+            current_start_success_streak = current_start_success_streak + 1 if greedy_solved else 0
 
-            if current_start_success_streak >= config["curriculum_success_streak"]:
-                current_start_success_streak = 0
-                seer_mastered_starts += 1
+            if int(control_mode) == env.SEER_NAV_PHASE:
+                if current_start_success_streak >= config["curriculum_success_streak"]:
+                    current_start_success_streak = 0
+                    seer_mastered_starts += 1
 
-                if seer_mastered_starts >= config["seer_required_start_positions"]:
-                    control_mode = communication_mode
-                    config["doer_perception_level"] = 2
-                    env.doer_perception_level = config["doer_perception_level"]
-                    communication_mastered_starts = 0
-                    print("Seer navigation mastered on five starts; switching to communication phase.")
-                else:
-                    print(
-                        f"Seer mastered start {seer_mastered_starts}/"
-                        f"{config['seer_required_start_positions']}."
-                    )
-
-                rng, _, fixed_start_position = sample_curriculum_anchor(
-                    env,
-                    rng,
-                    vision_radius,
-                    control_mode,
-                    fixed_goal_position=fixed_goal_position,
-                    exclude_start_position=fixed_start_position,
-                )
-                rng, env_obs, env_state = reset_curriculum_batch(
-                    env,
-                    rng,
-                    config["num_envs"],
-                    vision_radius,
-                    control_mode,
-                    fixed_goal_position,
-                    fixed_start_position,
-                )
-                seer_carry = seer.initialize_carry(config["num_envs"], 128)
-                doer_carry = doer.initialize_carry(config["num_envs"], 128)
-
-        if int(control_mode) == env.COMMUNICATION_PHASE:
-            mastered_current_start = (
-                float(rollout_success_rate) >= config["communication_mastery_success_rate"]
-                and float(cic_score) >= config["communication_mastery_cic_floor"]
-            )
-            current_start_success_streak = current_start_success_streak + 1 if mastered_current_start else 0
-
-            if current_start_success_streak >= config["curriculum_success_streak"]:
-                current_start_success_streak = 0
-                communication_mastered_starts += 1
-
-                if (
-                    communication_mastered_starts
-                    >= config["communication_start_positions_per_level"]
-                ):
-                    communication_mastered_starts = 0
-                    if config["doer_perception_level"] < config["max_doer_perception_level"]:
-                        config["doer_perception_level"] += 1
+                    if seer_mastered_starts >= config["seer_required_start_positions"]:
+                        control_mode = communication_mode
                         env.doer_perception_level = config["doer_perception_level"]
-                        print(
-                            f"Curriculum advanced to doer_perception_level="
-                            f"{config['doer_perception_level']}"
-                        )
+                        communication_mastered_starts = 0
+                        print("Seer navigation mastered on five starts; switching to communication phase.")
                     else:
-                        if (
-                            config["release_goal_after_max_level"]
-                            and not goal_randomization_enabled
-                        ):
-                            goal_randomization_enabled = True
-                            fixed_goal_position = UNSET_POSITION
-                            fixed_start_position = UNSET_POSITION
-                            print(
-                                "Max doer perception level mastered; releasing fixed goal "
-                                "and continuing in fully random Empty-Random-8x8."
-                            )
-                        else:
-                            print("Max doer perception level reached; continuing with new starts.")
+                        print(
+                            f"Seer mastered start {seer_mastered_starts}/"
+                            f"{config['seer_required_start_positions']}."
+                        )
 
-                if goal_randomization_enabled:
-                    rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
-                        env,
-                        rng,
-                        vision_radius,
-                        control_mode,
-                    )
-                else:
                     rng, _, fixed_start_position = sample_curriculum_anchor(
                         env,
                         rng,
@@ -619,17 +628,77 @@ def main():
                         fixed_goal_position=fixed_goal_position,
                         exclude_start_position=fixed_start_position,
                     )
-                rng, env_obs, env_state = reset_curriculum_batch(
-                    env,
-                    rng,
-                    config["num_envs"],
-                    vision_radius,
-                    control_mode,
-                    fixed_goal_position,
-                    fixed_start_position,
-                )
-                seer_carry = seer.initialize_carry(config["num_envs"], 128)
-                doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                    rng, env_obs, env_state = reset_curriculum_batch(
+                        env,
+                        rng,
+                        config["num_envs"],
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+                    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                    doer_carry = doer.initialize_carry(config["num_envs"], 128)
+
+            elif int(control_mode) == env.COMMUNICATION_PHASE:
+                if current_start_success_streak >= config["curriculum_success_streak"]:
+                    current_start_success_streak = 0
+                    communication_mastered_starts += 1
+
+                    if (
+                        communication_mastered_starts
+                        >= config["communication_start_positions_per_level"]
+                    ):
+                        communication_mastered_starts = 0
+                        if config["doer_perception_level"] < config["max_doer_perception_level"]:
+                            config["doer_perception_level"] += 1
+                            env.doer_perception_level = config["doer_perception_level"]
+                            print(
+                                f"Curriculum advanced to doer_perception_level="
+                                f"{config['doer_perception_level']}"
+                            )
+                        else:
+                            if (
+                                config["release_goal_after_max_level"]
+                                and not goal_randomization_enabled
+                            ):
+                                goal_randomization_enabled = True
+                                fixed_goal_position = UNSET_POSITION
+                                fixed_start_position = UNSET_POSITION
+                                print(
+                                    "Max doer perception level mastered; releasing fixed goal "
+                                    "and continuing in fully random Empty-Random-8x8."
+                                )
+                            else:
+                                print("Max doer perception level reached; continuing with new starts.")
+
+                    if goal_randomization_enabled:
+                        rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
+                            env,
+                            rng,
+                            vision_radius,
+                            control_mode,
+                        )
+                    else:
+                        rng, _, fixed_start_position = sample_curriculum_anchor(
+                            env,
+                            rng,
+                            vision_radius,
+                            control_mode,
+                            fixed_goal_position=fixed_goal_position,
+                            exclude_start_position=fixed_start_position,
+                        )
+                    rng, env_obs, env_state = reset_curriculum_batch(
+                        env,
+                        rng,
+                        config["num_envs"],
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+                    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                    doer_carry = doer.initialize_carry(config["num_envs"], 128)
 
 if __name__ == "__main__":
     main()
