@@ -33,6 +33,7 @@ def make_rollout_step(
         
         # Split the PRNG key for the stochastic actions
         rng, doer_rng, env_rng = jax.random.split(rng, 3)
+        doer_rng, seer_rng = jax.random.split(doer_rng)
         env_step_keys = jax.random.split(env_rng, num_envs)
         
         # 1. Seer Forward Pass (Prefrontal Cortex)
@@ -45,7 +46,8 @@ def make_rollout_step(
             {"params": params["seer"]}, 
             seer_carry, 
             global_map, 
-            symbolic_obs
+            symbolic_obs,
+            rngs={"noise": seer_rng}
         )
         
         # 2. Doer Forward Pass (Motor Cortex)
@@ -94,8 +96,12 @@ def make_rollout_step(
         progress_reward = info["progress_reward"]
         step_penalty = info["step_penalty"]
         bump_penalty = info["bump_penalty"]
+        
+        # Conditional Follow Reward: Only reward listening to Seer if it actually helped
+        actual_follow_reward = jnp.where(progress_reward > 0, follow_reward, 0.0)
+        
         seer_reward = task_reward + progress_reward - step_penalty
-        doer_reward = task_reward + progress_reward + follow_reward - step_penalty - bump_penalty
+        doer_reward = task_reward + progress_reward + actual_follow_reward - step_penalty - bump_penalty
         reward = jnp.stack([seer_reward, doer_reward], axis=-1)
 
         done_mask = done[:, None]

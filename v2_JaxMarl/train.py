@@ -4,6 +4,8 @@ import optax
 from pathlib import Path
 import flax.linen as nn
 from flax.training.train_state import TrainState
+import chex
+from typing import Any, Dict, Tuple
 
 # Import our custom modules
 from models.seer import Seer
@@ -17,47 +19,63 @@ from eval.visualize import visualize_episode
 import numpy as np
 import wandb
 
+@chex.dataclass
+class RunnerState:
+    actor_state: TrainState
+    critic_state: TrainState
+    seer_carry: jnp.ndarray
+    doer_carry: jnp.ndarray
+    env_state: Any
+    env_obs: Any
+    rng: jax.random.PRNGKey
+    update: int
+    success_streak: int
 
 # For the sake of a complete script, here is a pragmatic, standard Critic
 class GlobalCritic(nn.Module):
     """Evaluates the global state to guide learning (CTDE)."""
     @nn.compact
     def __call__(self, global_map: jnp.ndarray) -> jnp.ndarray:
-        x = nn.Conv(features=32, kernel_size=(3, 3))(global_map)
+        x = nn.Conv(features=32, kernel_size=(3, 3), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(global_map)
+        x = nn.relu(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
         x = nn.relu(x)
         x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(features=128)(x)
+        x = nn.Dense(features=128, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
         x = nn.relu(x)
-        value = nn.Dense(features=2)(x)
+        # Small scale for value head to stabilize early training
+        value = nn.Dense(features=2, kernel_init=nn.initializers.orthogonal(0.01))(x)
         return value
 
 def main():
     # 1. Configuration and Logging
     config = {
         "learning_rate": 3e-4,
-        "num_envs": 16,
+        "num_envs": 256,  # Increased for massive batch size -> critic stability
         "num_steps": 128,
-        "total_timesteps": 10_000_000,
+        "total_timesteps": 20_000_000, # Increased scale
         "env_id": "Navix-Empty-8x8-v0",
-        "fsq_levels": [4], # Defines the categorical hypercube
+        "fsq_levels": [4],
         "seed": 42,
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
-        "doer_perception_level": 3,
+        "doer_perception_level": 0,
         "curriculum_success_streak": 3,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "visualize_every": 400,
-        "visualize_max_steps": 30,
+        "visualize_every": 50,
+        "visualize_max_steps": 10,
         "visualize_dir": "artifacts/episodes",
+        "log_every": 5,
+        "log_distribution_every": 10,
+        "log_heatmap_every": 50,
     }
     
-    wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+    wandb.init(entity="eleftheriaklk-ucl", project="brian_test_optimized", config=config)
     
     # 2. PRNG Key Initialization
-    # JAX requires explicit, rigorous management of randomness
     rng = jax.random.PRNGKey(config["seed"])
     rng, seer_init_rng, doer_init_rng, critic_init_rng, env_rng = jax.random.split(rng, 5)
 
@@ -73,9 +91,8 @@ def main():
     )
 
     # 4. Initial Environment Reset
-    rng, env_rng = jax.random.split(rng, 2)
-    reset_keys = jax.random.split(env_rng, config["num_envs"])
-    # Give initial full vision radius of 3.0 for the 7x7 local crop
+    reset_rng, env_rng = jax.random.split(env_rng, 2)
+    reset_keys = jax.random.split(reset_rng, config["num_envs"])
     env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
 
     # 5. Network Instantiation
@@ -83,39 +100,31 @@ def main():
     doer = Doer(fsq_levels=config["fsq_levels"], num_actions=env.num_actions)
     critic = GlobalCritic()
 
-    # 6. Parameter Initialization (Dummy Forward Passes)
-    # We must pass data of the correct shape to initialize the Flax parameters
-    dummy_map = env_obs["global_map"][:1]
-    dummy_sym = env_obs["symbolic_state"][:1]
-    dummy_local = env_obs["local_view"][:1]
-    dummy_prop = env_obs["proprioception"][:1]
-    dummy_msg = jnp.zeros((1, len(config["fsq_levels"])))
+    # 6. Parameter Initialization
+    env_map = env_obs["global_map"][:1]
+    env_sym = env_obs["symbolic_state"][:1]
+    env_local = env_obs["local_view"][:1]
+    env_prop = env_obs["proprioception"][:1]
+    env_msg = jnp.zeros((1, len(config["fsq_levels"])))
     
-    init_seer_carry = seer.initialize_carry(1, 128)
-    init_doer_carry = doer.initialize_carry(1, 128)
+    init_seer_carry_single = seer.initialize_carry(1, 128)
+    init_doer_carry_single = doer.initialize_carry(1, 128)
 
-    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym)["params"]
-    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
-    critic_params = critic.init(critic_init_rng, dummy_map)["params"]
+    seer_params = seer.init(seer_init_rng, init_seer_carry_single, env_map, env_sym)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry_single, env_local, env_prop, env_msg)["params"]
+    critic_params = critic.init(critic_init_rng, env_map)["params"]
 
     seer_carry = seer.initialize_carry(config["num_envs"], 128)
     doer_carry = doer.initialize_carry(config["num_envs"], 128)
 
-    # Group parameters for the execution loop
-    params = {"seer": seer_params, "doer": doer_params, "critic": critic_params}
-
-    # 6. Optimizer and TrainState Setup
-    # Optax provides the gradient transformation tools
+    # 7. Optimizer and TrainState Setup
     tx = optax.chain(
         optax.clip_by_global_norm(0.5),
         optax.adam(learning_rate=config["learning_rate"], eps=1e-5)
     )
 
-    # Since the Seer and Doer act cooperatively to generate the trajectory,
-    # we can conceptually treat them as a single "Actor" policy for the optimizer.
-    # In a more advanced setup, you might give them separate optimizers.
     actor_state = TrainState.create(
-        apply_fn=None, # We use specific apply fns in the update step
+        apply_fn=None,
         params={"seer": seer_params, "doer": doer_params},
         tx=tx
     )
@@ -133,44 +142,36 @@ def main():
         critic.apply,
         follow_reward_scale=config["follow_reward_scale"],
     )
-    success_streak = 0
 
-    # 8. The Main Training Loop
-    num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
-    
-    print(
-        "Starting training... "
-        f"(doer_perception_level={config['doer_perception_level']})"
-    )
-    for update in range(num_updates):
-        rng, rollout_rng = jax.random.split(rng)
+    # 8. Define the training step for jax.lax.scan
+    def train_step(runner_state: RunnerState, _):
+        # A. Curriculums
+        update = runner_state.update
+        # Restore constants for stability as requested by the user previously
+        vision_radius = 3.0 
+        seer_entropy_coef = 0.1 
         
-        # Curriculums
-        vision_radius = jnp.clip(3.0 - 2.0 * (update / 1000.0), 1.0, 3.0)
-        seer_entropy_coef = jnp.clip(0.1 - 0.09 * (update / 1000.0), 0.01, 0.1)
+        # B. Collect Trajectory
+        rng, rollout_rng = jax.random.split(runner_state.rng)
         
-        # A. Collect Trajectory
-        init_seer_carry = seer_carry
-        init_doer_carry = doer_carry
+        params = {
+            "seer": runner_state.actor_state.params["seer"],
+            "doer": runner_state.actor_state.params["doer"],
+            "critic": runner_state.critic_state.params
+        }
         
-        final_runner_state, trajectory_batch = generate_trajectory_and_gae(
+        final_rollout_state, trajectory_batch = generate_trajectory_and_gae(
             params,
             rollout_rng,
-            env_obs,
-            env_state,
-            seer_carry,
-            doer_carry,
+            runner_state.env_obs,
+            runner_state.env_state,
+            runner_state.seer_carry,
+            runner_state.doer_carry,
             vision_radius,
             jnp.array(config["cic_coef"], dtype=jnp.float32),
             config["num_steps"],
             step_fn, critic.apply, doer.apply
         )
-        
-        # Extract for next loop iteration
-        params, seer_carry, doer_carry, env_state, env_obs, _, _ = final_runner_state
-        
-        # B. Generalized Advantage Estimation (GAE)
-        # GAE is now calculated inside generate_trajectory_and_gae
         
         # C. Update Networks
         rng, actor_rng, critic_rng = jax.random.split(rng, 3)
@@ -179,161 +180,190 @@ def main():
             lambda x: jnp.swapaxes(x, 0, 1),
             trajectory_batch
         )
-        batched_seer_carry = init_seer_carry
-        batched_doer_carry = init_doer_carry
-
+        
         actor_state, actor_metrics = update_actor(
-            actor_state, batched_trajectory, batched_seer_carry, batched_doer_carry, 
+            runner_state.actor_state, 
+            batched_trajectory, 
+            runner_state.seer_carry, 
+            runner_state.doer_carry, 
             seer.apply, doer.apply, actor_rng, seer_entropy_coef
         )
         critic_state, critic_metrics = update_critic(
-            critic_state, batched_trajectory, critic.apply, critic_rng
+            runner_state.critic_state, 
+            batched_trajectory, 
+            critic.apply, critic_rng
         )
         
-        # Sync updated parameters back to the params dictionary for the next rollout
-        params["seer"] = actor_state.params["seer"]
-        params["doer"] = actor_state.params["doer"]
-        params["critic"] = critic_state.params
+        # D. Update Runner State
+        _, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, _, _ = final_rollout_state
         
-        # D. Logging
-        if update % 10 == 0:
-            wandb.log({
-                "update": update,
-                "actor_loss": actor_metrics.get("actor_loss", 0.0),
-                "entropy": actor_metrics.get("entropy", 0.0),
-                "critic_loss": critic_metrics.get("critic_loss", 0.0),
-                "seer_reward": trajectory_batch.reward[..., 0].mean(),
-                "doer_reward": trajectory_batch.reward[..., 1].mean(),
-                "task_reward": trajectory_batch.task_reward.mean(),
-                "progress_reward": trajectory_batch.progress_reward.mean(),
-                "follow_reward": trajectory_batch.follow_reward.mean(),
-                "step_penalty_component": trajectory_batch.step_penalty_component.mean(),
-                "bump_penalty_component": trajectory_batch.bump_penalty_component.mean(),
-                "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
-                "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
-                "thought_variance": actor_metrics.get("thought_variance", 0.0),
-                "vision_radius": vision_radius,
-                "seer_entropy_coef": seer_entropy_coef,
-                "doer_perception_level": config["doer_perception_level"],
-                "curriculum_success_streak": success_streak,
-            })
-            rng, cic_rng = jax.random.split(rng)
-            cic_score = compute_cic(
-                doer.apply,
-                params["doer"],
-                trajectory_batch,
-                init_doer_carry,
-                cic_rng
-            )
-            print(
-                f"Update {update}/{num_updates} | "
-                f"Level: {config['doer_perception_level']} | "
-                f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
-                f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
-                f"Task: {trajectory_batch.task_reward.mean():.3f} | "
-                f"Progress: {trajectory_batch.progress_reward.mean():.3f} | "
-                f"Follow: {trajectory_batch.follow_reward.mean():.3f} | "
-                f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
-                f"Bump: {trajectory_batch.bump_penalty_component.mean():.3f} | "
-                f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
-                f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
-                f"CIC: {cic_score:.3f}"
-            )
-            
-            # Log a small sample of the discrete messages to see distribution
-            sample_msgs = actor_metrics.get("discrete_messages")
-            if sample_msgs is not None:
-                # Shape might be flattened over sequence and batch. Let's just print the first 5 elements safely.
-                flat_msgs = sample_msgs.reshape((-1, len(config["fsq_levels"])))
-                print(f"Message sample: {flat_msgs[0:5]}")
+        next_state = RunnerState(
+            actor_state=actor_state,
+            critic_state=critic_state,
+            seer_carry=next_seer_carry,
+            doer_carry=next_doer_carry,
+            env_state=next_env_state,
+            env_obs=next_env_obs,
+            rng=rng,
+            update=update + 1,
+            success_streak=runner_state.success_streak
+        )
+        
+        metrics = {
+            "update": update,
+            "seer_loss": actor_metrics.get("seer_loss", 0.0),
+            "doer_loss": actor_metrics.get("doer_loss", 0.0),
+            "entropy": actor_metrics.get("entropy", 0.0),
+            "critic_loss": critic_metrics.get("critic_loss", 0.0),
+            "seer_reward": trajectory_batch.reward[..., 0].mean(),
+            "doer_reward": trajectory_batch.reward[..., 1].mean(),
+            "task_reward": trajectory_batch.task_reward.mean(),
+            "progress_reward": trajectory_batch.progress_reward.mean(),
+            "follow_reward": trajectory_batch.follow_reward.mean(),
+            "vision_radius": vision_radius,
+            "seer_entropy_coef": seer_entropy_coef,
+            "thought_variance": actor_metrics.get("thought_variance", 0.0),
+            "discrete_messages": actor_metrics.get("discrete_messages"),
+            "trajectory_batch": trajectory_batch, # Partially return for CIC calculation outside scan if needed
+        }
+        
+        return next_state, metrics
 
-        # E. Causal Influence of Communication and Heatmap logging
-        if update % 50 == 0:
+    # 9. Initial Runner State
+    runner_state = RunnerState(
+        actor_state=actor_state,
+        critic_state=critic_state,
+        seer_carry=seer_carry,
+        doer_carry=doer_carry,
+        env_state=env_state,
+        env_obs=env_obs,
+        rng=rng,
+        update=0,
+        success_streak=0
+    )
 
-            
-            # Compute Heatmap
-            levels = np.array(config["fsq_levels"], dtype=np.int32)
-            multipliers = np.ones_like(levels)
-            for idx in range(len(levels) - 2, -1, -1):
-                multipliers[idx] = multipliers[idx + 1] * levels[idx + 1]
+    # Compile the training block
+    train_block = jax.jit(lambda state: jax.lax.scan(train_step, state, None, length=config["log_every"]))
 
-            m = np.rint(np.array(trajectory_batch.message)).astype(np.int32)
-            m = np.clip(m, 0, levels - 1)
-            a = np.array(trajectory_batch.action)
-            m_flat = (m * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
-            a_flat = a.astype(np.int32).reshape(-1)
+    # 10. The Main Training Loop (Python side handles logging and viz)
+    total_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
+    num_blocks = total_updates // config["log_every"]
+    
+    print(f"Starting optimized training with {config['num_envs']} envs...")
+    
+    for block in range(num_blocks):
+        runner_state, metrics = train_block(runner_state)
+        
+        # Extract the last update's metrics for logging
+        last_metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics)
+        update_idx = int(last_metrics["update"])
+        
+        # A. Logging to WandB
+        log_dict = {
+            "update": update_idx,
+            "seer_loss": last_metrics["seer_loss"],
+            "doer_loss": last_metrics["doer_loss"],
+            "entropy": last_metrics["entropy"],
+            "critic_loss": last_metrics["critic_loss"],
+            "seer_reward": last_metrics["seer_reward"],
+            "doer_reward": last_metrics["doer_reward"],
+            "task_reward": last_metrics["task_reward"],
+            "progress_reward": last_metrics["progress_reward"],
+            "follow_reward": last_metrics["follow_reward"],
+            "seer_entropy_coef": last_metrics["seer_entropy_coef"],
+            "curriculum_level": env.doer_perception_level,
+        }
+
+        # B. Periodic Evaluation and Visualization
+        if update_idx > 0 and update_idx % config["log_distribution_every"] == 0:
+            print(f"Update {update_idx} | Seer/Doer Loss: {last_metrics['seer_loss']:.3f}/{last_metrics['doer_loss']:.3f} | Task Reward: {last_metrics['task_reward']:.3f}")
             
-            num_actions = env.num_actions
+            # Log message distribution as a histogram
+            msgs = metrics["discrete_messages"].reshape(-1) # Flatten all messages in the block
+            log_dict["message_distribution"] = wandb.Histogram(np.array(msgs))
+
+        # C. Signal-to-Action Heatmap (Auditing if discrete symbols correlate with actions)
+        if update_idx > 0 and update_idx % config["log_heatmap_every"] == 0:
+            traj = metrics["trajectory_batch"]
+            m = np.array(traj.message).reshape((-1, len(config["fsq_levels"])))
+            a = np.array(traj.action).reshape(-1)
+            
+            levels = np.array(config["fsq_levels"])
+            if len(levels) == 1:
+                m_idx = m[:, 0]
+            else:
+                multipliers = np.cumprod(np.concatenate([np.array([1]), levels[:-1]]))
+                m_idx = (m * multipliers).sum(axis=-1)
+            
             num_message_codes = int(np.prod(levels))
+            num_actions = env.num_actions
             H, _, _ = np.histogram2d(
-                m_flat,
-                a_flat,
+                m_idx, a, 
                 bins=[np.arange(num_message_codes + 1), np.arange(num_actions + 1)]
             )
-            
-            try:
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(5, 10))
-                cax = ax.imshow(H, aspect='auto', cmap='viridis', interpolation='none')
-                fig.colorbar(cax)
-                ax.set_xlabel("Doer Action")
-                ax.set_ylabel("Seer Message Index")
-                ax.set_title(f"Signal-to-Action Heatmap (CIC: {cic_score:.3f})")
-                heatmap_log = wandb.Image(fig)
-                plt.close(fig)
-            except ImportError:
-                heatmap_log = wandb.Image(H / (H.max() + 1e-8))
-                pass
+            log_dict["signal_action_heatmap"] = wandb.Image(H / (H.max() + 1e-8))
 
-            wandb.log({
-                "CIC_Score": cic_score,
-                "Signal_Action_Heatmap": heatmap_log
-            }, commit=False)
-            
-            
-
-        if update > 0 and update % config["visualize_every"] == 0:
-            rng, viz_rng = jax.random.split(rng)
-            viz_path = Path(config["visualize_dir"]) / f"episode_{update:05d}.gif"
+        if update_idx > 0 and update_idx % config["visualize_every"] == 0:
+            params = {
+                "seer": runner_state.actor_state.params["seer"],
+                "doer": runner_state.actor_state.params["doer"],
+                "critic": runner_state.critic_state.params
+            }
+            rng, viz_rng = jax.random.split(runner_state.rng)
+            viz_path = Path(config["visualize_dir"]) / f"episode_{update_idx:05d}.gif"
             _, solved = visualize_episode(
-                env,
-                params,
-                viz_rng,
-                seer,
-                doer,
+                env, params, viz_rng, seer, doer,
                 filename=str(viz_path),
-                vision_radius=vision_radius,
+                vision_radius=3.0,
                 max_steps=config["visualize_max_steps"],
             )
-            if solved:
-                success_streak += 1
-            else:
-                success_streak = 0
+            
+            # Log Video to WandB
+            log_dict.update({
+                "episode_viz": wandb.Video(str(viz_path), fps=4, format="gif"),
+                "episode_solved": float(solved)
+            })
 
-            if (
-                success_streak >= config["curriculum_success_streak"]
-                and config["doer_perception_level"] < 3
-            ):
-                config["doer_perception_level"] += 1
-                success_streak = 0
-                env.doer_perception_level = config["doer_perception_level"]
-                step_fn = make_rollout_step(
-                    env,
-                    seer.apply,
-                    doer.apply,
-                    critic.apply,
-                    follow_reward_scale=config["follow_reward_scale"],
-                )
+            # Compute and log CIC score (Seer Score)
+            rng, cic_rng = jax.random.split(runner_state.rng)
+            last_traj = jax.tree_util.tree_map(lambda x: x[-1], metrics["trajectory_batch"])
+            cic_score = compute_cic(
+                doer.apply, params["doer"], last_traj, runner_state.doer_carry, cic_rng
+            )
+            log_dict["CIC_Score"] = cic_score
 
-                rng, env_rng = jax.random.split(rng, 2)
-                reset_keys = jax.random.split(env_rng, config["num_envs"])
-                env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
-                seer_carry = seer.initialize_carry(config["num_envs"], 128)
-                doer_carry = doer.initialize_carry(config["num_envs"], 128)
-                print(
-                    f"Curriculum advanced to doer_perception_level="
-                    f"{config['doer_perception_level']}"
-                )
+        # D. Curriculum Check (Decoupled from visualization)
+        # Average number of maze completions per environment during this block
+        traj_batch = metrics["trajectory_batch"]
+        completions_per_env = np.sum(traj_batch.task_reward) / config["num_envs"]
+        
+        # If at least 80% of envs completed the maze at least once
+        if completions_per_env >= 0.8:
+            runner_state = runner_state.replace(success_streak=runner_state.success_streak + 1)
+        else:
+            runner_state = runner_state.replace(success_streak=0)
+            
+        log_dict["success_streak"] = runner_state.success_streak
+        log_dict["completions_per_env"] = completions_per_env
+
+        # Finally, upload everything!
+        wandb.log(log_dict)
+
+        # Manual Level advancement logic
+        if runner_state.success_streak >= config["curriculum_success_streak"] and env.doer_perception_level < 3:
+            env.doer_perception_level += 1
+            curr_level = env.doer_perception_level
+            print(f"Advancing to perception level {curr_level}")
+            
+            # Re-compile step_fn with new env setting (or make level a dyn param if preferred)
+            step_fn = make_rollout_step(env, seer.apply, doer.apply, critic.apply, follow_reward_scale=config["follow_reward_scale"])
+            train_block = jax.jit(lambda state: jax.lax.scan(train_step, state, None, length=config["log_every"]))
+            
+            # Reset envs for the new level
+            rng, env_rng = jax.random.split(runner_state.rng, 2)
+            reset_keys = jax.random.split(env_rng, config["num_envs"])
+            new_obs, new_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
+            runner_state = runner_state.replace(env_obs=new_obs, env_state=new_state, rng=rng)
 
 if __name__ == "__main__":
     main()

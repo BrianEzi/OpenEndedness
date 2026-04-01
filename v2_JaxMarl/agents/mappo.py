@@ -38,6 +38,7 @@ def calculate_actor_losses(
     transition_batch: Transition,
     init_seer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
     init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
+    actor_rng: jax.random.PRNGKey,
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01)
@@ -49,12 +50,11 @@ def calculate_actor_losses(
     # Wait, loop.py returns (num_steps, ...) for single env. Let's assume unbatched or reshape-able.
     # If the user is unrolling over dimension 0:
     
-    def scan_fn(carry, transition_step):
-        # Step shape assertions:
-        # chex.assert_rank(transition_step.action, 1) # (batch_size,)
-        # chex.assert_rank(transition_step.global_obs, 4) # (batch_size, H, W, C)
-        
+    scan_rngs = jax.random.split(actor_rng, transition_batch.action.shape[0])
+    
+    def scan_fn(carry, transition_step_and_rng):
         seer_carry, doer_carry = carry
+        transition_step, step_rng = transition_step_and_rng
         
         # Seer Forward Pass
         next_seer_carry, discrete_message, thought_vector = seer_apply_fn(
@@ -62,6 +62,7 @@ def calculate_actor_losses(
             seer_carry,
             transition_step.global_obs,
             transition_step.symbolic_obs,
+            rngs={"noise": step_rng}
         )
         
         # Doer Forward Pass
@@ -77,7 +78,7 @@ def calculate_actor_losses(
     _, (logits, discrete_messages, thought_vectors) = jax.lax.scan(
         scan_fn, 
         (init_seer_carry, init_doer_carry), 
-        transition_batch
+        (transition_batch, scan_rngs)
     )
     
     pi = distrax.Categorical(logits=logits)
@@ -101,8 +102,10 @@ def calculate_actor_losses(
 
     # Calculate aux metrics for information bottleneck auditing
     thought_variance = jnp.var(thought_vectors, axis=0).mean()
+    # L2 penalty to prevent pre-tanh values from saturating FSQ
+    thought_penalty = jnp.mean(jnp.square(thought_vectors))
 
-    seer_loss = seer_actor_loss - seer_entropy_coef * thought_variance
+    seer_loss = seer_actor_loss + 0.001 * thought_penalty
     doer_loss = doer_actor_loss - entropy_coef * entropy
 
     return (seer_loss, doer_loss), {
@@ -110,7 +113,7 @@ def calculate_actor_losses(
         "doer_actor_loss": doer_actor_loss,
         "entropy": entropy,
         "ratio": ratio.mean(),
-        "thought_variance": thought_variance,
+        "thought_variance": thought_variance, # Kept for logging visibility
         "discrete_messages": discrete_messages
     }
 
@@ -171,7 +174,8 @@ def update_actor(
         # Shuffle along the batch dimension
         permutation = jax.random.permutation(subkey, batch_size)
         
-        def minibatch_fn(state, start_idx):
+        def minibatch_fn(state, start_idx_and_key):
+            start_idx, mb_key = start_idx_and_key
             # Slice the minibatch
             indices = jax.lax.dynamic_slice_in_dim(permutation, start_idx, minibatch_size)
             mb_transition = jax.tree_util.tree_map(lambda x: x[indices], transition_batch)
@@ -195,6 +199,7 @@ def update_actor(
                     mb_transition_time_first,
                     mb_seer_carry,
                     mb_doer_carry,
+                    mb_key,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return seer_loss, metrics
@@ -207,6 +212,7 @@ def update_actor(
                     mb_transition_time_first,
                     mb_seer_carry,
                     mb_doer_carry,
+                    mb_key,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return doer_loss, metrics
@@ -244,7 +250,8 @@ def update_actor(
             
         # Minibatch loop (scan over start_indices)
         start_indices = jnp.arange(0, batch_size, minibatch_size)
-        actor_state, mb_metrics = jax.lax.scan(minibatch_fn, actor_state, start_indices)
+        mb_keys = jax.random.split(subkey, start_indices.shape[0])
+        actor_state, mb_metrics = jax.lax.scan(minibatch_fn, actor_state, (start_indices, mb_keys))
         
         # Average metrics over minibatches
         epoch_metrics = {k: v.mean() if k != "discrete_messages" else v[0] for k, v in mb_metrics.items()}

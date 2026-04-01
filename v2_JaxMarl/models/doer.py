@@ -33,35 +33,29 @@ class Doer(nn.Module):
             action_logits: Unnormalized log probabilities for the discrete action space.
         """
         
-        # 1. Message Encoder: Learned Lookup Table
-        # To preserve gradients, we MUST NOT cast to int and use nn.Embed directly 
-        # Instead, FSQ naturally provides continuous coordinates (that happen to be quantized).
-        # We can just linearly project this entire vector directly into a latent space!
-        message_features = nn.Dense(features=self.embed_dim * len(self.fsq_levels))(message)
+        # 1. Message Encoder
+        message_features = nn.Dense(features=self.embed_dim * len(self.fsq_levels), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(message)
         message_features = nn.relu(message_features)
         
         # 2. Local Visual Encoder
-        # Even for a small 3x3 grid, a single convolution or a dense layer extracts features
-        x = nn.Conv(features=16, kernel_size=(2, 2))(local_obs)
+        x = nn.Conv(features=16, kernel_size=(2, 2), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(local_obs)
         x = nn.relu(x)
         x_flat = x.reshape((x.shape[0], -1))
         
         # 3. Proprioception Encoder
-        p = nn.Dense(features=16)(proprioception)
+        p = nn.Dense(features=16, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(proprioception)
         p = nn.relu(p)
         
         # 4. Fusion
-        # Combine local vision, proprioception, and the embedded command
         fused_features = jnp.concatenate([x_flat, p, message_features], axis=-1)
         
-        # 5. Reasoning Module: LSTM
-        # Critical for integrating sequences of commands (e.g., maintaining a "Wait" state)
+        # 5. Reasoning Module
         lstm_cell = nn.LSTMCell(features=self.lstm_features)
         new_carry, lstm_out = lstm_cell(carry, fused_features)
         
         # 6. Output Head: Discrete Action Space
-        # Projects the LSTM memory state into logits for physical actions
-        action_logits = nn.Dense(features=self.num_actions)(lstm_out)
+        # Use small scale for action head initial stability
+        action_logits = nn.Dense(features=self.num_actions, kernel_init=nn.initializers.orthogonal(0.01))(lstm_out)
         
         return new_carry, action_logits
 

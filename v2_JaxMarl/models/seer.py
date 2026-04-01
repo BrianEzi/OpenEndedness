@@ -33,22 +33,19 @@ class Seer(nn.Module):
             thought_vector: The continuous pre-quantization vector (useful for logging/critic).
         """
         
-        # 1. Visual Encoder: CNN for the grid visual 
-        x = nn.Conv(features=32, kernel_size=(3, 3), strides=(1, 1), padding='SAME')(map_obs)
+        # 1. Visual Encoder
+        x = nn.Conv(features=32, kernel_size=(3, 3), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(map_obs)
         x = nn.relu(x)
-        x = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding='SAME')(x)
+        x = nn.Conv(features=64, kernel_size=(3, 3), kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(x)
         x = nn.relu(x)
         
-        # Flatten visual features to a 1D vector per batch item
-        # shape changes from (batch, H, W, channels) to (batch, H * W * channels)
         x_flat = x.reshape((x.shape[0], -1)) 
         
-        # 2. Symbolic Encoder: MLP for symbolic data 
-        y = nn.Dense(features=64)(symbolic_obs)
+        # 2. Symbolic Encoder
+        y = nn.Dense(features=64, kernel_init=nn.initializers.orthogonal(jnp.sqrt(2)))(symbolic_obs)
         y = nn.relu(y)
         
         # 3. Fusion
-        # Concatenate the visual and symbolic pathways into a single representation 
         fused_features = jnp.concatenate([x_flat, y], axis=-1)
         
         # 4. Reasoning Module: LSTM 
