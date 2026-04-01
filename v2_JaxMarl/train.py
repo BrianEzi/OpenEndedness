@@ -246,7 +246,7 @@ def main():
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "visualize_every": 400,
+        "visualize_every": 200,
         "message_trace_every": 100,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
