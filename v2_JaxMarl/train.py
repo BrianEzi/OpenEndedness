@@ -243,13 +243,12 @@ def compute_message_stats(message_batch, fsq_levels):
     entropy = float(-(nonzero_probs * np.log(nonzero_probs)).sum()) if nonzero_probs.size else 0.0
     max_entropy = float(np.log(num_codes)) if num_codes > 1 else 0.0
     normalized_entropy = entropy / max_entropy if max_entropy > 0.0 else 0.0
-    dominant_fraction = float(probs.max()) if probs.size else 0.0
     unique_codes = int((counts > 0).sum())
     return {
         "message_codes": message_codes,
+        "message_code_probs": probs,
         "rollout_message_entropy": entropy,
         "rollout_message_entropy_normalized": normalized_entropy,
-        "rollout_message_dominant_fraction": dominant_fraction,
         "rollout_message_unique_codes": unique_codes,
         "rollout_message_num_codes": num_codes,
     }
@@ -290,82 +289,6 @@ def log_curriculum_visualization(
         },
         commit=False,
     )
-
-
-def build_message_distribution_log(message_stats):
-    counts = np.bincount(
-        message_stats["message_codes"],
-        minlength=message_stats["rollout_message_num_codes"],
-    ).astype(np.float32)
-    probs = counts / max(float(counts.sum()), 1.0)
-    code_labels = [str(idx) for idx in range(message_stats["rollout_message_num_codes"])]
-
-    try:
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(6, 3))
-        bars = ax.bar(code_labels, probs, color="#1f77b4", edgecolor="#0f3057", linewidth=1.0)
-        ax.set_ylim(0.0, 1.0)
-        ax.set_xlabel("Message Code")
-        ax.set_ylabel("Probability")
-        ax.set_title("Seer Message Distribution")
-        ax.grid(axis="y", linestyle=":", alpha=0.35)
-        for bar, prob in zip(bars, probs):
-            ax.text(
-                bar.get_x() + bar.get_width() / 2.0,
-                bar.get_height() + 0.02,
-                f"{prob:.2f}",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-            )
-        fig.tight_layout()
-        image = wandb.Image(fig)
-        plt.close(fig)
-        return image
-    except ImportError:
-        return wandb.Image(probs[None, :])
-
-
-def build_signal_action_heatmap_log(histogram, cic_score):
-    row_sums = histogram.sum(axis=1, keepdims=True)
-    normalized = np.divide(
-        histogram,
-        np.maximum(row_sums, 1.0),
-        out=np.zeros_like(histogram, dtype=np.float32),
-        where=row_sums > 0,
-    )
-
-    try:
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(5, 4))
-        im = ax.imshow(normalized, aspect="auto", cmap="Blues", vmin=0.0, vmax=1.0)
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="P(action | message)")
-        ax.set_xlabel("Doer Action")
-        ax.set_ylabel("Seer Message Code")
-        ax.set_title(f"Signal-Action Heatmap | CIC {cic_score:.3f}")
-        ax.set_xticks(np.arange(histogram.shape[1]))
-        ax.set_yticks(np.arange(histogram.shape[0]))
-        for row_idx in range(normalized.shape[0]):
-            for col_idx in range(normalized.shape[1]):
-                value = normalized[row_idx, col_idx]
-                if value > 0.01:
-                    ax.text(
-                        col_idx,
-                        row_idx,
-                        f"{value:.2f}",
-                        ha="center",
-                        va="center",
-                        color="#0b1f33" if value < 0.6 else "white",
-                        fontsize=8,
-                    )
-        fig.tight_layout()
-        image = wandb.Image(fig)
-        plt.close(fig)
-        return image
-    except ImportError:
-        return wandb.Image(normalized)
 
 
 def main():
@@ -579,7 +502,6 @@ def main():
         )
         message_stats = compute_message_stats(trajectory_batch.message, config["fsq_levels"])
         cic_score = float(trajectory_batch.cic_score.mean())
-        cic_reward_component = float(trajectory_batch.cic_reward_component.mean())
         
         # D. Logging
         if update % 10 == 0:
@@ -590,46 +512,21 @@ def main():
                 phase_label = "communication_random_full"
             else:
                 phase_label = "communication_random_start"
+            message_distribution_log = {
+                f"message_code_prob_{code_idx}": float(prob)
+                for code_idx, prob in enumerate(message_stats["message_code_probs"])
+            }
             wandb.log({
-                "update": update,
-                "training_phase": int(control_mode),
                 "phase_label": phase_label,
-                "actor_loss": actor_metrics.get("actor_loss", 0.0),
-                "entropy": actor_metrics.get("entropy", 0.0),
-                "critic_loss": critic_metrics.get("critic_loss", 0.0),
-                "seer_reward": trajectory_batch.reward[..., 0].mean(),
-                "doer_reward": trajectory_batch.reward[..., 1].mean(),
+                "doer_perception_level": config["doer_perception_level"],
+                "rollout_success_rate": rollout_success_rate,
                 "task_reward": trajectory_batch.task_reward.mean(),
                 "progress_reward": trajectory_batch.progress_reward.mean(),
-                "follow_reward": trajectory_batch.follow_reward.mean(),
-                "step_penalty_component": trajectory_batch.step_penalty_component.mean(),
-                "bump_penalty_component": trajectory_batch.bump_penalty_component.mean(),
-                "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
-                "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
-                "policy_message_entropy": actor_metrics.get("message_entropy", 0.0),
-                "policy_message_entropy_normalized": actor_metrics.get("message_entropy_normalized", 0.0),
-                "policy_message_dominant_probability": actor_metrics.get("message_dominant_probability", 0.0),
-                "seer_nav_entropy": actor_metrics.get("seer_nav_entropy", 0.0),
-                "rollout_message_entropy": message_stats["rollout_message_entropy"],
-                "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
-                "rollout_message_dominant_fraction": message_stats["rollout_message_dominant_fraction"],
-                "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
                 "cic_score": cic_score,
-                "cic_reward_component": cic_reward_component,
-                "cic_coef": config["cic_coef"],
-                "vision_radius": vision_radius,
-                "seer_entropy_coef": seer_entropy_coef,
-                "doer_perception_level": config["doer_perception_level"],
-                "current_start_success_streak": current_start_success_streak,
-                "seer_mastered_starts": seer_mastered_starts,
-                "communication_mastered_starts": communication_mastered_starts,
-                "rollout_success_rate": rollout_success_rate,
-                "rollout_num_successes": rollout_num_successes,
-                "goal_randomization_enabled": int(goal_randomization_enabled),
-                "fixed_goal_row": fixed_goal_position[0],
-                "fixed_goal_col": fixed_goal_position[1],
-                "fixed_start_row": fixed_start_position[0],
-                "fixed_start_col": fixed_start_position[1],
+                "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                **message_distribution_log,
             })
             print(
                 f"Update {update}/{num_updates} | "
@@ -645,15 +542,13 @@ def main():
                 f"Progress: {trajectory_batch.progress_reward.mean():.3f} | "
                 f"Follow: {trajectory_batch.follow_reward.mean():.3f} | "
                 f"MsgH: {message_stats['rollout_message_entropy_normalized']:.3f} | "
-                f"MsgDom: {message_stats['rollout_message_dominant_fraction']:.3f} | "
                 f"MsgUsed: {message_stats['rollout_message_unique_codes']}/"
                 f"{message_stats['rollout_message_num_codes']} | "
                 f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
                 f"Bump: {trajectory_batch.bump_penalty_component.mean():.3f} | "
                 f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
                 f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
-                f"CIC: {cic_score:.3f} | "
-                f"CICReward: {cic_reward_component:.5f}"
+                f"CIC: {cic_score:.3f}"
             )
             
             if (
@@ -676,28 +571,6 @@ def main():
                 print("Communication trace:")
                 for line in trace_lines:
                     print(line)
-
-        # E. Causal Influence of Communication and Heatmap logging
-        if update % 50 == 0 and int(control_mode) == env.COMMUNICATION_PHASE:
-            a = np.array(trajectory_batch.doer_action)
-            m_flat = message_stats["message_codes"]
-            a_flat = a.astype(np.int32).reshape(-1)
-            
-            num_actions = env.num_actions
-            num_message_codes = message_stats["rollout_message_num_codes"]
-            H, _, _ = np.histogram2d(
-                m_flat,
-                a_flat,
-                bins=[np.arange(num_message_codes + 1), np.arange(num_actions + 1)]
-            )
-            heatmap_log = build_signal_action_heatmap_log(H, cic_score)
-            message_distribution_log = build_message_distribution_log(message_stats)
-
-            wandb.log({
-                "CIC_Score": cic_score,
-                "Signal_Action_Heatmap": heatmap_log,
-                "Message_Distribution": message_distribution_log,
-            }, commit=False)
 
         if update > 0 and update % config["curriculum_eval_every"] == 0:
             rng, greedy_solved = evaluate_greedy_episode(
