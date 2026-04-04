@@ -26,11 +26,45 @@ class Transition:
     task_reward: chex.Array
     progress_reward: chex.Array
     follow_reward: chex.Array
+    cic_reward_component: chex.Array
+    cic_score: chex.Array
     step_penalty_component: chex.Array
     bump_penalty_component: chex.Array
     done: chex.Array
     advantage: chex.Array
     return_val: chex.Array
+
+
+def _build_message_codebook(message_levels: Tuple[int, ...], dtype: jnp.dtype) -> jnp.ndarray:
+    axes = [jnp.arange(level, dtype=dtype) for level in message_levels]
+    mesh = jnp.meshgrid(*axes, indexing="ij")
+    return jnp.stack(mesh, axis=-1).reshape((-1, len(message_levels)))
+
+
+def _compute_message_entropy_metrics(
+    discrete_messages: chex.Array,
+    message_levels: Tuple[int, ...],
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Approximate discrete-code usage with a soft histogram so gradients can flow."""
+    flat_messages = discrete_messages.reshape((-1, discrete_messages.shape[-1]))
+    codebook = _build_message_codebook(message_levels, flat_messages.dtype)
+    sq_distances = jnp.sum(
+        jnp.square(flat_messages[:, None, :] - codebook[None, :, :]),
+        axis=-1,
+    )
+    assignment_probs = nn.softmax(-10.0 * sq_distances, axis=-1)
+    code_probs = assignment_probs.mean(axis=0)
+    code_probs = code_probs / (code_probs.sum() + 1e-8)
+    message_entropy = -jnp.sum(code_probs * jnp.log(code_probs + 1e-8))
+
+    num_codes = codebook.shape[0]
+    if num_codes > 1:
+        normalized_entropy = message_entropy / jnp.log(jnp.asarray(num_codes, dtype=flat_messages.dtype))
+    else:
+        normalized_entropy = jnp.asarray(0.0, dtype=flat_messages.dtype)
+
+    dominant_code_prob = jnp.max(code_probs)
+    return message_entropy, normalized_entropy, dominant_code_prob
 
 # 2. Loss Functions: Separated from network definitions
 def calculate_actor_losses(
@@ -41,6 +75,7 @@ def calculate_actor_losses(
     init_seer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
     init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray], # Changed from Any to Tuple
     control_mode: jnp.ndarray,
+    message_levels: Tuple[int, ...],
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01)
@@ -125,9 +160,10 @@ def calculate_actor_losses(
     doer_actor_loss = -jnp.minimum(doer_loss_unclipped, doer_loss_clipped).mean()
     doer_actor_loss = jnp.where(communication_mode, doer_actor_loss, 0.0)
 
-    # Calculate aux metrics for information bottleneck auditing
-    thought_variance = jnp.var(thought_vectors, axis=0).mean()
-    seer_bonus = jnp.where(communication_mode, thought_variance, seer_nav_entropy)
+    message_entropy, message_entropy_normalized, dominant_code_prob = (
+        _compute_message_entropy_metrics(discrete_messages, message_levels)
+    )
+    seer_bonus = jnp.where(communication_mode, message_entropy, seer_nav_entropy)
 
     seer_loss = seer_actor_loss - seer_entropy_coef * seer_bonus
     doer_loss = doer_actor_loss - jnp.where(communication_mode, entropy_coef * doer_entropy, 0.0)
@@ -138,7 +174,9 @@ def calculate_actor_losses(
         "entropy": jnp.where(communication_mode, doer_entropy, seer_nav_entropy),
         "seer_ratio": seer_ratio.mean(),
         "doer_ratio": doer_ratio.mean(),
-        "thought_variance": thought_variance,
+        "message_entropy": message_entropy,
+        "message_entropy_normalized": message_entropy_normalized,
+        "message_dominant_probability": dominant_code_prob,
         "seer_nav_entropy": seer_nav_entropy,
         "discrete_messages": discrete_messages
     }
@@ -171,7 +209,16 @@ def calculate_critic_loss(
 # 3. The Update Step: JIT-compiled gradient application
 import functools
 
-@functools.partial(jax.jit, static_argnames=("seer_apply_fn", "doer_apply_fn", "num_ppo_epochs", "num_minibatches"))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "seer_apply_fn",
+        "doer_apply_fn",
+        "message_levels",
+        "num_ppo_epochs",
+        "num_minibatches",
+    ),
+)
 def update_actor(
     actor_state: TrainState, 
     transition_batch: Transition,
@@ -181,6 +228,7 @@ def update_actor(
     doer_apply_fn: Callable,
     rng: jax.random.PRNGKey,
     control_mode: jnp.ndarray,
+    message_levels: Tuple[int, ...],
     seer_entropy_coef: jnp.ndarray,
     num_ppo_epochs: int = 4,
     num_minibatches: int = 1
@@ -226,6 +274,7 @@ def update_actor(
                     mb_seer_carry,
                     mb_doer_carry,
                     control_mode=control_mode,
+                    message_levels=message_levels,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return seer_loss, metrics
@@ -239,6 +288,7 @@ def update_actor(
                     mb_seer_carry,
                     mb_doer_carry,
                     control_mode=control_mode,
+                    message_levels=message_levels,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return doer_loss, metrics
@@ -266,7 +316,9 @@ def update_actor(
                 "entropy": doer_metrics["entropy"],
                 "seer_ratio": seer_metrics["seer_ratio"],
                 "doer_ratio": doer_metrics["doer_ratio"],
-                "thought_variance": seer_metrics["thought_variance"],
+                "message_entropy": seer_metrics["message_entropy"],
+                "message_entropy_normalized": seer_metrics["message_entropy_normalized"],
+                "message_dominant_probability": seer_metrics["message_dominant_probability"],
                 "seer_nav_entropy": seer_metrics["seer_nav_entropy"],
                 "discrete_messages": seer_metrics["discrete_messages"],
                 "seer_grad_norm": seer_grad_norm,

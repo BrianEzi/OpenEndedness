@@ -12,7 +12,6 @@ from envs.navix_wrapper import NavixGridWrapper, UNSET_POSITION
 from training.loop import generate_trajectory_and_gae, make_rollout_step
 from agents.mappo import update_actor, update_critic, Transition
 import navix as nx
-from eval.metrics import compute_cic
 from eval.visualize import visualize_episode
 import numpy as np
 import wandb
@@ -223,6 +222,39 @@ def evaluate_greedy_episode(
     return rng, solved
 
 
+def flatten_message_codes(message_batch, fsq_levels):
+    levels = np.asarray(fsq_levels, dtype=np.int32)
+    multipliers = np.ones_like(levels)
+    for idx in range(len(levels) - 2, -1, -1):
+        multipliers[idx] = multipliers[idx + 1] * levels[idx + 1]
+
+    messages = np.rint(np.asarray(message_batch)).astype(np.int32)
+    messages = np.clip(messages, 0, levels - 1)
+    return (messages * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
+
+
+def compute_message_stats(message_batch, fsq_levels):
+    message_codes = flatten_message_codes(message_batch, fsq_levels)
+    num_codes = int(np.prod(np.asarray(fsq_levels, dtype=np.int32)))
+    counts = np.bincount(message_codes, minlength=num_codes).astype(np.float32)
+    total = max(int(counts.sum()), 1)
+    probs = counts / float(total)
+    nonzero_probs = probs[probs > 0.0]
+    entropy = float(-(nonzero_probs * np.log(nonzero_probs)).sum()) if nonzero_probs.size else 0.0
+    max_entropy = float(np.log(num_codes)) if num_codes > 1 else 0.0
+    normalized_entropy = entropy / max_entropy if max_entropy > 0.0 else 0.0
+    dominant_fraction = float(probs.max()) if probs.size else 0.0
+    unique_codes = int((counts > 0).sum())
+    return {
+        "message_codes": message_codes,
+        "rollout_message_entropy": entropy,
+        "rollout_message_entropy_normalized": normalized_entropy,
+        "rollout_message_dominant_fraction": dominant_fraction,
+        "rollout_message_unique_codes": unique_codes,
+        "rollout_message_num_codes": num_codes,
+    }
+
+
 def main():
     # 1. Configuration and Logging
     config = {
@@ -235,7 +267,7 @@ def main():
         "seed": 42,
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.2,
-        "cic_coef": 0.0,
+        "cic_coef": 0.01,
         "doer_perception_level": 2,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
@@ -405,7 +437,12 @@ def main():
 
         actor_state, actor_metrics = update_actor(
             actor_state, batched_trajectory, batched_seer_carry, batched_doer_carry, 
-            seer.apply, doer.apply, actor_rng, control_mode, seer_entropy_coef
+            seer.apply,
+            doer.apply,
+            actor_rng,
+            control_mode,
+            tuple(config["fsq_levels"]),
+            seer_entropy_coef,
         )
         critic_state, critic_metrics = update_critic(
             critic_state, batched_trajectory, critic.apply, critic_rng
@@ -428,6 +465,9 @@ def main():
             / completed_episodes.astype(jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
         )
+        message_stats = compute_message_stats(trajectory_batch.message, config["fsq_levels"])
+        cic_score = float(trajectory_batch.cic_score.mean())
+        cic_reward_component = float(trajectory_batch.cic_reward_component.mean())
         
         # D. Logging
         if update % 10 == 0:
@@ -454,8 +494,17 @@ def main():
                 "bump_penalty_component": trajectory_batch.bump_penalty_component.mean(),
                 "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
                 "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
-                "thought_variance": actor_metrics.get("thought_variance", 0.0),
+                "policy_message_entropy": actor_metrics.get("message_entropy", 0.0),
+                "policy_message_entropy_normalized": actor_metrics.get("message_entropy_normalized", 0.0),
+                "policy_message_dominant_probability": actor_metrics.get("message_dominant_probability", 0.0),
                 "seer_nav_entropy": actor_metrics.get("seer_nav_entropy", 0.0),
+                "rollout_message_entropy": message_stats["rollout_message_entropy"],
+                "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                "rollout_message_dominant_fraction": message_stats["rollout_message_dominant_fraction"],
+                "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                "cic_score": cic_score,
+                "cic_reward_component": cic_reward_component,
+                "cic_coef": config["cic_coef"],
                 "vision_radius": vision_radius,
                 "seer_entropy_coef": seer_entropy_coef,
                 "doer_perception_level": config["doer_perception_level"],
@@ -470,16 +519,6 @@ def main():
                 "fixed_start_row": fixed_start_position[0],
                 "fixed_start_col": fixed_start_position[1],
             })
-            cic_score = 0.0
-            if in_communication_phase:
-                rng, cic_rng = jax.random.split(rng)
-                cic_score = compute_cic(
-                    doer.apply,
-                    params["doer"],
-                    trajectory_batch,
-                    init_doer_carry,
-                    cic_rng
-            )
             print(
                 f"Update {update}/{num_updates} | "
                 f"Phase: {phase_label} | "
@@ -493,11 +532,16 @@ def main():
                 f"Task: {trajectory_batch.task_reward.mean():.3f} | "
                 f"Progress: {trajectory_batch.progress_reward.mean():.3f} | "
                 f"Follow: {trajectory_batch.follow_reward.mean():.3f} | "
+                f"MsgH: {message_stats['rollout_message_entropy_normalized']:.3f} | "
+                f"MsgDom: {message_stats['rollout_message_dominant_fraction']:.3f} | "
+                f"MsgUsed: {message_stats['rollout_message_unique_codes']}/"
+                f"{message_stats['rollout_message_num_codes']} | "
                 f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
                 f"Bump: {trajectory_batch.bump_penalty_component.mean():.3f} | "
                 f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
                 f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
-                f"CIC: {cic_score:.3f}"
+                f"CIC: {cic_score:.3f} | "
+                f"CICReward: {cic_reward_component:.5f}"
             )
             
             if (
@@ -526,19 +570,12 @@ def main():
 
             
             # Compute Heatmap
-            levels = np.array(config["fsq_levels"], dtype=np.int32)
-            multipliers = np.ones_like(levels)
-            for idx in range(len(levels) - 2, -1, -1):
-                multipliers[idx] = multipliers[idx + 1] * levels[idx + 1]
-
-            m = np.rint(np.array(trajectory_batch.message)).astype(np.int32)
-            m = np.clip(m, 0, levels - 1)
             a = np.array(trajectory_batch.doer_action)
-            m_flat = (m * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
+            m_flat = message_stats["message_codes"]
             a_flat = a.astype(np.int32).reshape(-1)
             
             num_actions = env.num_actions
-            num_message_codes = int(np.prod(levels))
+            num_message_codes = message_stats["rollout_message_num_codes"]
             H, _, _ = np.histogram2d(
                 m_flat,
                 a_flat,

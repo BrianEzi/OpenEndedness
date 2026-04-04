@@ -166,6 +166,8 @@ def make_rollout_step(
             task_reward=task_reward,
             progress_reward=progress_reward,
             follow_reward=follow_reward,
+            cic_reward_component=jnp.zeros_like(task_reward),
+            cic_score=jnp.zeros_like(task_reward),
             step_penalty_component=step_penalty,
             bump_penalty_component=bump_penalty,
             done=done,
@@ -224,7 +226,7 @@ def generate_trajectory_and_gae(
     
     # 2. Extract the final state for Critic bootstrapping
     # Unpack the final runner state to get the last env_obs
-    _, _, _, _, final_env_obs, _, _, _, _, _ = final_runner_state
+    _, _, _, _, final_env_obs, final_rng, _, _, _, _ = final_runner_state
     
     # Enforce CTDE: The critic evaluates the global map 
     final_global_map = final_env_obs["global_map"]
@@ -233,7 +235,32 @@ def generate_trajectory_and_gae(
     # The critic evaluates the state *after* the final step
     last_val = critic_apply_fn({"params": params["critic"]}, final_global_map)
     
-    reward_with_cic = trajectory_batch.reward
+    communication_mode = control_mode == 1
+
+    def add_cic_bonus(_):
+        cic_score = compute_cic(
+            doer_apply_fn,
+            params["doer"],
+            trajectory_batch,
+            doer_carry,
+            final_rng,
+        )
+        per_step_cic_reward = cic_coef * cic_score / jnp.asarray(num_steps, dtype=jnp.float32)
+        cic_reward_component = jnp.full_like(trajectory_batch.task_reward, per_step_cic_reward)
+        cic_score_component = jnp.full_like(trajectory_batch.task_reward, cic_score)
+        reward_with_cic = trajectory_batch.reward + cic_reward_component[..., None]
+        return reward_with_cic, cic_reward_component, cic_score_component
+
+    def skip_cic_bonus(_):
+        zeros = jnp.zeros_like(trajectory_batch.task_reward)
+        return trajectory_batch.reward, zeros, zeros
+
+    reward_with_cic, cic_reward_component, cic_score_component = jax.lax.cond(
+        jnp.logical_and(communication_mode, cic_coef > 0.0),
+        add_cic_bonus,
+        skip_cic_bonus,
+        operand=None,
+    )
     
     # 5. Compute GAE
     # Note: If you scale up to multiple environments (num_envs > 1), you would wrap 
@@ -259,6 +286,9 @@ def generate_trajectory_and_gae(
     # 5. Update the trajectory batch
     # Using the .replace() method provided by chex/flax dataclasses
     trajectory_batch = trajectory_batch.replace(
+        reward=reward_with_cic,
+        cic_reward_component=cic_reward_component,
+        cic_score=cic_score_component,
         advantage=advantages,
         return_val=returns
     )
