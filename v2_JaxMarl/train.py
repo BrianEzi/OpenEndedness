@@ -512,6 +512,15 @@ def main():
                 phase_label = "communication_random_full"
             else:
                 phase_label = "communication_random_start"
+            phase_indicators = {
+                "phase_seer_nav": int(phase_label == "seer_nav"),
+                "phase_communication_random_start": int(
+                    phase_label == "communication_random_start"
+                ),
+                "phase_communication_random_full": int(
+                    phase_label == "communication_random_full"
+                ),
+            }
             message_distribution_log = {
                 f"message_code_prob_{code_idx}": float(prob)
                 for code_idx, prob in enumerate(message_stats["message_code_probs"])
@@ -526,6 +535,7 @@ def main():
                 "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
                 "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
                 "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                **phase_indicators,
                 **message_distribution_log,
             })
             print(
@@ -596,6 +606,11 @@ def main():
                         control_mode = communication_mode
                         env.doer_perception_level = config["doer_perception_level"]
                         communication_mastered_starts = 0
+                        print("")
+                        print("=" * 72)
+                        print("NEW PHASE: communication")
+                        print("=" * 72)
+                        print("")
                         print("Seer navigation mastered on five starts; switching to communication phase.")
                     else:
                         print(
@@ -676,6 +691,11 @@ def main():
                                 goal_randomization_enabled = True
                                 fixed_goal_position = UNSET_POSITION
                                 fixed_start_position = UNSET_POSITION
+                                print("")
+                                print("=" * 72)
+                                print("NEW SUBCASE: communication_random_full")
+                                print("=" * 72)
+                                print("")
                                 print(
                                     "Max doer perception level mastered; releasing fixed goal "
                                     "and continuing in fully random Empty-Random-8x8."
