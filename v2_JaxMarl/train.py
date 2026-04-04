@@ -656,6 +656,14 @@ def main():
                         if config["doer_perception_level"] < config["max_doer_perception_level"]:
                             config["doer_perception_level"] += 1
                             env.doer_perception_level = config["doer_perception_level"]
+                            print("")
+                            print("=" * 72)
+                            print(
+                                "NEW DOER PERCEPTION LEVEL: "
+                                f"{config['doer_perception_level']}"
+                            )
+                            print("=" * 72)
+                            print("")
                             print(
                                 f"Curriculum advanced to doer_perception_level="
                                 f"{config['doer_perception_level']}"
@@ -676,12 +684,22 @@ def main():
                                 print("Max doer perception level reached; continuing with new starts.")
 
                     if goal_randomization_enabled:
+                        previous_goal_position = fixed_goal_position
                         rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
                             env,
                             rng,
                             vision_radius,
                             control_mode,
                         )
+                        if not np.array_equal(
+                            np.asarray(previous_goal_position),
+                            np.asarray(fixed_goal_position),
+                        ):
+                            print("")
+                            print("=" * 72)
+                            print(f"NEW RANDOM GOAL: {tuple(np.asarray(fixed_goal_position).tolist())}")
+                            print("=" * 72)
+                            print("")
                     else:
                         rng, _, fixed_start_position = sample_curriculum_anchor(
                             env,
