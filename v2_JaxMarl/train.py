@@ -255,6 +255,119 @@ def compute_message_stats(message_batch, fsq_levels):
     }
 
 
+def log_curriculum_visualization(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    config,
+    update,
+    phase_label,
+    vision_radius,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    viz_path = Path(config["visualize_dir"]) / f"{phase_label}_{update:05d}.gif"
+    output_path, solved = visualize_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        filename=str(viz_path),
+        vision_radius=vision_radius,
+        max_steps=config["visualize_max_steps"],
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+    wandb.log(
+        {
+            "curriculum_reset_episode": wandb.Video(str(output_path), format="gif"),
+            "curriculum_reset_episode_solved": int(solved),
+        },
+        commit=False,
+    )
+
+
+def build_message_distribution_log(message_stats):
+    counts = np.bincount(
+        message_stats["message_codes"],
+        minlength=message_stats["rollout_message_num_codes"],
+    ).astype(np.float32)
+    probs = counts / max(float(counts.sum()), 1.0)
+    code_labels = [str(idx) for idx in range(message_stats["rollout_message_num_codes"])]
+
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6, 3))
+        bars = ax.bar(code_labels, probs, color="#1f77b4", edgecolor="#0f3057", linewidth=1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.set_xlabel("Message Code")
+        ax.set_ylabel("Probability")
+        ax.set_title("Seer Message Distribution")
+        ax.grid(axis="y", linestyle=":", alpha=0.35)
+        for bar, prob in zip(bars, probs):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                bar.get_height() + 0.02,
+                f"{prob:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        fig.tight_layout()
+        image = wandb.Image(fig)
+        plt.close(fig)
+        return image
+    except ImportError:
+        return wandb.Image(probs[None, :])
+
+
+def build_signal_action_heatmap_log(histogram, cic_score):
+    row_sums = histogram.sum(axis=1, keepdims=True)
+    normalized = np.divide(
+        histogram,
+        np.maximum(row_sums, 1.0),
+        out=np.zeros_like(histogram, dtype=np.float32),
+        where=row_sums > 0,
+    )
+
+    try:
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        im = ax.imshow(normalized, aspect="auto", cmap="Blues", vmin=0.0, vmax=1.0)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="P(action | message)")
+        ax.set_xlabel("Doer Action")
+        ax.set_ylabel("Seer Message Code")
+        ax.set_title(f"Signal-Action Heatmap | CIC {cic_score:.3f}")
+        ax.set_xticks(np.arange(histogram.shape[1]))
+        ax.set_yticks(np.arange(histogram.shape[0]))
+        for row_idx in range(normalized.shape[0]):
+            for col_idx in range(normalized.shape[1]):
+                value = normalized[row_idx, col_idx]
+                if value > 0.01:
+                    ax.text(
+                        col_idx,
+                        row_idx,
+                        f"{value:.2f}",
+                        ha="center",
+                        va="center",
+                        color="#0b1f33" if value < 0.6 else "white",
+                        fontsize=8,
+                    )
+        fig.tight_layout()
+        image = wandb.Image(fig)
+        plt.close(fig)
+        return image
+    except ImportError:
+        return wandb.Image(normalized)
+
+
 def main():
     # 1. Configuration and Logging
     config = {
@@ -278,7 +391,6 @@ def main():
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "visualize_every": 200,
         "message_trace_every": 100,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
@@ -567,9 +679,6 @@ def main():
 
         # E. Causal Influence of Communication and Heatmap logging
         if update % 50 == 0 and int(control_mode) == env.COMMUNICATION_PHASE:
-
-            
-            # Compute Heatmap
             a = np.array(trajectory_batch.doer_action)
             m_flat = message_stats["message_codes"]
             a_flat = a.astype(np.int32).reshape(-1)
@@ -581,50 +690,14 @@ def main():
                 a_flat,
                 bins=[np.arange(num_message_codes + 1), np.arange(num_actions + 1)]
             )
-            
-            try:
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(5, 10))
-                cax = ax.imshow(H, aspect='auto', cmap='viridis', interpolation='none')
-                fig.colorbar(cax)
-                ax.set_xlabel("Doer Action")
-                ax.set_ylabel("Seer Message Index")
-                ax.set_title(f"Signal-to-Action Heatmap (CIC: {cic_score:.3f})")
-                heatmap_log = wandb.Image(fig)
-                plt.close(fig)
-            except ImportError:
-                heatmap_log = wandb.Image(H / (H.max() + 1e-8))
-                pass
+            heatmap_log = build_signal_action_heatmap_log(H, cic_score)
+            message_distribution_log = build_message_distribution_log(message_stats)
 
             wandb.log({
                 "CIC_Score": cic_score,
-                "Signal_Action_Heatmap": heatmap_log
+                "Signal_Action_Heatmap": heatmap_log,
+                "Message_Distribution": message_distribution_log,
             }, commit=False)
-            
-            
-
-        if update > 0 and update % config["visualize_every"] == 0:
-            rng, viz_rng = jax.random.split(rng)
-            if int(control_mode) == env.SEER_NAV_PHASE:
-                prefix = "seer_nav"
-            elif goal_randomization_enabled:
-                prefix = "communication_random_full"
-            else:
-                prefix = "communication_random_start"
-            viz_path = Path(config["visualize_dir"]) / f"{prefix}_{update:05d}.gif"
-            visualize_episode(
-                env,
-                params,
-                viz_rng,
-                seer,
-                doer,
-                filename=str(viz_path),
-                vision_radius=vision_radius,
-                max_steps=config["visualize_max_steps"],
-                control_mode=control_mode,
-                fixed_goal_position=fixed_goal_position,
-                fixed_start_position=fixed_start_position,
-            )
 
         if update > 0 and update % config["curriculum_eval_every"] == 0:
             rng, greedy_solved = evaluate_greedy_episode(
@@ -676,6 +749,26 @@ def main():
                     )
                     seer_carry = seer.initialize_carry(config["num_envs"], 128)
                     doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                    print("")
+                    print("=" * 72)
+                    print(f"NEW RANDOM POSITION: {tuple(np.asarray(fixed_start_position).tolist())}")
+                    print("=" * 72)
+                    print("")
+                    rng, viz_rng = jax.random.split(rng)
+                    log_curriculum_visualization(
+                        env,
+                        params,
+                        viz_rng,
+                        seer,
+                        doer,
+                        config,
+                        update,
+                        "seer_nav_reset",
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
 
             elif int(control_mode) == env.COMMUNICATION_PHASE:
                 if current_start_success_streak >= config["curriculum_success_streak"]:
@@ -736,6 +829,31 @@ def main():
                     )
                     seer_carry = seer.initialize_carry(config["num_envs"], 128)
                     doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                    print("")
+                    print("=" * 72)
+                    print(f"NEW RANDOM POSITION: {tuple(np.asarray(fixed_start_position).tolist())}")
+                    print("=" * 72)
+                    print("")
+                    rng, viz_rng = jax.random.split(rng)
+                    phase_label = (
+                        "communication_random_full_reset"
+                        if goal_randomization_enabled
+                        else "communication_random_start_reset"
+                    )
+                    log_curriculum_visualization(
+                        env,
+                        params,
+                        viz_rng,
+                        seer,
+                        doer,
+                        config,
+                        update,
+                        phase_label,
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
 
 if __name__ == "__main__":
     main()
