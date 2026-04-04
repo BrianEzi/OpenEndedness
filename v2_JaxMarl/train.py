@@ -320,6 +320,9 @@ def main():
     }
     
     wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+
+    print(f"backend: {jax.default_backend()}")
+    print(f"devices: {jax.devices()}")
     
     # 2. PRNG Key Initialization
     # JAX requires explicit, rigorous management of randomness
@@ -521,13 +524,10 @@ def main():
                     phase_label == "communication_random_full"
                 ),
             }
-            message_distribution_log = {
-                f"message_code_prob_{code_idx}": float(prob)
-                for code_idx, prob in enumerate(message_stats["message_code_probs"])
-            }
             wandb.log({
                 "phase_label": phase_label,
                 "doer_perception_level": config["doer_perception_level"],
+                "current_start_success_streak": current_start_success_streak,
                 "rollout_success_rate": rollout_success_rate,
                 "task_reward": trajectory_batch.task_reward.mean(),
                 "progress_reward": trajectory_batch.progress_reward.mean(),
@@ -535,8 +535,10 @@ def main():
                 "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
                 "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
                 "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                "message_distribution": wandb.Histogram(
+                    np.asarray(message_stats["message_codes"])
+                ),
                 **phase_indicators,
-                **message_distribution_log,
             })
             print(
                 f"Update {update}/{num_updates} | "
