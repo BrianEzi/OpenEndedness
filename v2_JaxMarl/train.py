@@ -18,6 +18,8 @@ from eval.metrics import compute_cic
 from eval.visualize import visualize_episode
 import numpy as np
 import wandb
+import matplotlib.pyplot as plt
+import io
 
 @chex.dataclass
 class RunnerState:
@@ -28,6 +30,7 @@ class RunnerState:
     env_state: Any
     env_obs: Any
     rng: jax.random.PRNGKey
+    global_layout_keys: jnp.ndarray
     update: int
     success_streak: int
 
@@ -53,24 +56,25 @@ def main():
         "learning_rate": 3e-4,
         "num_envs": 256,  # Increased for massive batch size -> critic stability
         "num_steps": 128,
-        "total_timesteps": 20_000_000, # Increased scale
-        "env_id": "Navix-Empty-8x8-v0",
+        "total_timesteps": 10_000_000, # Increased scale
+        "env_id": "Navix-Empty-Random-8x8-v0", 
         "fsq_levels": [4],
         "seed": 42,
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.2,
         "cic_coef": 0.0,
-        "doer_perception_level": 0,
+        "doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "visualize_every": 50,
+        "visualize_every": 20,
         "visualize_max_steps": 10,
         "visualize_dir": "artifacts/episodes",
-        "log_every": 5,
-        "log_distribution_every": 10,
-        "log_heatmap_every": 50,
+        "log_every": 1,
+        "log_distribution_every": 5,
+        "log_heatmap_every": 20,
+        "log_cic_every": 10,
     }
     
     wandb.init(entity="eleftheriaklk-ucl", project="brian_test_optimized", config=config)
@@ -92,8 +96,12 @@ def main():
 
     # 4. Initial Environment Reset
     reset_rng, env_rng = jax.random.split(env_rng, 2)
-    reset_keys = jax.random.split(reset_rng, config["num_envs"])
-    env_obs, env_state = env.reset_batch(reset_keys, vision_radius=jnp.array(3.0))
+    # initial global_layout_key
+    global_layout_key, env_rng = jax.random.split(env_rng, 2)
+    # Generate exactly identical reset keys for all environments on the host-side to prevent XLA compile explosion
+    # By repeating the array outside JIT, XLA doesn't try to hyper-optimize and get stuck in while-loops.
+    global_layout_keys = jnp.repeat(global_layout_key[None, :], config["num_envs"], axis=0)
+    env_obs, env_state = env.reset_batch(global_layout_keys, vision_radius=jnp.array(3.0))
 
     # 5. Network Instantiation
     seer = Seer(fsq_levels=config["fsq_levels"])
@@ -168,6 +176,7 @@ def main():
             runner_state.seer_carry,
             runner_state.doer_carry,
             vision_radius,
+            runner_state.global_layout_keys,
             jnp.array(config["cic_coef"], dtype=jnp.float32),
             config["num_steps"],
             step_fn, critic.apply, doer.apply
@@ -195,7 +204,7 @@ def main():
         )
         
         # D. Update Runner State
-        _, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, _, _ = final_rollout_state
+        _, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, _, _, next_global_layout_keys = final_rollout_state
         
         next_state = RunnerState(
             actor_state=actor_state,
@@ -205,6 +214,7 @@ def main():
             env_state=next_env_state,
             env_obs=next_env_obs,
             rng=rng,
+            global_layout_keys=next_global_layout_keys,
             update=update + 1,
             success_streak=runner_state.success_streak
         )
@@ -225,6 +235,7 @@ def main():
             "thought_variance": actor_metrics.get("thought_variance", 0.0),
             "discrete_messages": actor_metrics.get("discrete_messages"),
             "trajectory_batch": trajectory_batch, # Partially return for CIC calculation outside scan if needed
+
         }
         
         return next_state, metrics
@@ -238,6 +249,7 @@ def main():
         env_state=env_state,
         env_obs=env_obs,
         rng=rng,
+        global_layout_keys=global_layout_keys,
         update=0,
         success_streak=0
     )
@@ -251,12 +263,19 @@ def main():
     
     print(f"Starting optimized training with {config['num_envs']} envs...")
     
+    mastered_environments = 0
+    
     for block in range(num_blocks):
         runner_state, metrics = train_block(runner_state)
         
         # Extract the last update's metrics for logging
         last_metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics)
         update_idx = int(last_metrics["update"])
+        
+        
+        # Calculate vocab_used on the host side using numpy to avoid JAX static shaping issues
+        msgs = metrics["discrete_messages"]
+        vocab_used = len(np.unique(np.array(msgs)))
         
         # A. Logging to WandB
         log_dict = {
@@ -271,12 +290,13 @@ def main():
             "progress_reward": last_metrics["progress_reward"],
             "follow_reward": last_metrics["follow_reward"],
             "seer_entropy_coef": last_metrics["seer_entropy_coef"],
+            "vocab_used": vocab_used,
             "curriculum_level": env.doer_perception_level,
         }
 
         # B. Periodic Evaluation and Visualization
         if update_idx > 0 and update_idx % config["log_distribution_every"] == 0:
-            print(f"Update {update_idx} | Seer/Doer Loss: {last_metrics['seer_loss']:.3f}/{last_metrics['doer_loss']:.3f} | Task Reward: {last_metrics['task_reward']:.3f}")
+            print(f"Update {update_idx} | Seer/Doer Loss: {last_metrics['seer_loss']:.4f}/{last_metrics['doer_loss']:.4f} | Task Reward: {last_metrics['task_reward']:.4f}")
             
             # Log message distribution as a histogram
             msgs = metrics["discrete_messages"].reshape(-1) # Flatten all messages in the block
@@ -301,7 +321,40 @@ def main():
                 m_idx, a, 
                 bins=[np.arange(num_message_codes + 1), np.arange(num_actions + 1)]
             )
-            log_dict["signal_action_heatmap"] = wandb.Image(H / (H.max() + 1e-8))
+            
+            # Row Normalization to show P(Action | Message)
+            row_sums = H.sum(axis=1, keepdims=True)
+            H_norm = np.divide(H, row_sums, out=np.zeros_like(H), where=row_sums!=0)
+            
+            fig, ax = plt.subplots(figsize=(6, 6))
+            im = ax.imshow(H_norm, cmap='viridis')
+            ax.set_xticks(np.arange(num_actions))
+            ax.set_yticks(np.arange(num_message_codes))
+            ax.set_xticklabels(['Forward', 'Left', 'Right']) # Navix specific
+            ax.set_ylabel('Message Index (FSQ Code)')
+            ax.set_title('P(Action | Message)')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            
+            # Log top messages representation
+            top_msgs = np.argsort(row_sums.flatten())[::-1][:5]
+            action_labels = ['Forward', 'Left', 'Right']
+            msg_table_data = []
+            for tm in top_msgs:
+                if row_sums[tm][0] > 0:
+                    dominant_action_idx = np.argmax(H_norm[tm])
+                    dominant_action = action_labels[dominant_action_idx]
+                    percentage = H_norm[tm][dominant_action_idx] * 100
+                    msg_table_data.append([str(tm), f"{dominant_action} ({percentage:.1f}%)"])
+            
+            log_dict["top_message_meanings"] = wandb.Table(data=msg_table_data, columns=["Message ID", "Dominant Meaning"])
+
+            from PIL import Image
+            buf = io.BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight')
+            buf.seek(0)
+            heatmap_img = Image.open(buf)
+            log_dict["signal_action_heatmap"] = wandb.Image(heatmap_img)
+            plt.close(fig)
 
         if update_idx > 0 and update_idx % config["visualize_every"] == 0:
             params = {
@@ -324,11 +377,12 @@ def main():
                 "episode_solved": float(solved)
             })
 
+        if update_idx > 0 and update_idx % config["log_cic_every"] == 0:
             # Compute and log CIC score (Seer Score)
             rng, cic_rng = jax.random.split(runner_state.rng)
             last_traj = jax.tree_util.tree_map(lambda x: x[-1], metrics["trajectory_batch"])
             cic_score = compute_cic(
-                doer.apply, params["doer"], last_traj, runner_state.doer_carry, cic_rng
+                doer.apply, runner_state.actor_state.params["doer"], last_traj, runner_state.doer_carry, cic_rng
             )
             log_dict["CIC_Score"] = cic_score
 
@@ -337,14 +391,34 @@ def main():
         traj_batch = metrics["trajectory_batch"]
         completions_per_env = np.sum(traj_batch.task_reward) / config["num_envs"]
         
-        # If at least 80% of envs completed the maze at least once
-        if completions_per_env >= 0.8:
-            runner_state = runner_state.replace(success_streak=runner_state.success_streak + 1)
+        # Single-Environment Mastery Check
+        if completions_per_env >= 0.9:
+            mastered_environments += 1
+            print(f"Mastered layout! Switching to new layout (Total mastered: {mastered_environments})")
+            
+            # Re-roll a single new map for ALL environments
+            rng = runner_state.rng
+            rng, new_seed_rng = jax.random.split(rng)
+            new_global_layout_key, _ = jax.random.split(new_seed_rng)
+            
+            # Reset all current envs on the new layout
+            new_global_layout_keys = jnp.repeat(new_global_layout_key[None, :], config["num_envs"], axis=0)
+            new_obs, new_state = env.reset_batch(new_global_layout_keys, vision_radius=jnp.array(3.0))
+            
+            # Immediately overwrite the state locally
+            runner_state = runner_state.replace(
+                env_obs=new_obs,
+                env_state=new_state,
+                global_layout_keys=new_global_layout_keys,
+                rng=rng,
+                success_streak=runner_state.success_streak + 1
+            )
         else:
             runner_state = runner_state.replace(success_streak=0)
             
         log_dict["success_streak"] = runner_state.success_streak
         log_dict["completions_per_env"] = completions_per_env
+        log_dict["mastered_environments"] = mastered_environments
 
         # Finally, upload everything!
         wandb.log(log_dict)

@@ -28,13 +28,16 @@ def make_rollout_step(
         Designed to be passed directly to jax.lax.scan.
         """
         # Unpack the runner state
-        params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius = runner_state
+        params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius, global_layout_keys = runner_state
         num_envs = env_obs["global_map"].shape[0]
         
         # Split the PRNG key for the stochastic actions
         rng, doer_rng, env_rng = jax.random.split(rng, 3)
         doer_rng, seer_rng = jax.random.split(doer_rng)
-        env_step_keys = jax.random.split(env_rng, num_envs)
+        
+        # We broadcast the identical global_layout_key to all environments!
+        # This guarantees any environment that hits `done` will reset to the EXACT same layout.
+        env_step_keys = global_layout_keys
         
         # 1. Seer Forward Pass (Prefrontal Cortex)
         # Enforcing CTDE: Seer gets the global view[cite: 131, 132].
@@ -138,7 +141,7 @@ def make_rollout_step(
         
         # Repack the updated runner state
         next_runner_state = (
-            params, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, rng, vision_radius
+            params, next_seer_carry, next_doer_carry, next_env_state, next_env_obs, rng, vision_radius, global_layout_keys
         )
         
         return next_runner_state, transition
@@ -149,7 +152,7 @@ import functools
 
 @functools.partial(jax.jit, static_argnames=("num_steps", "step_fn", "critic_apply_fn", "doer_apply_fn"))
 def generate_trajectory_and_gae(
-    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
+    params, rng, env_obs, env_state, seer_carry, doer_carry, vision_radius: jnp.ndarray, global_layout_keys: jnp.ndarray, cic_coef: jnp.ndarray, num_steps: int,
     step_fn, critic_apply_fn, doer_apply_fn
 ):
     """
@@ -157,7 +160,7 @@ def generate_trajectory_and_gae(
     Note: We pass the pre-compiled step_fn and initial states directly here 
     for better JAX compilation efficiency.
     """
-    initial_runner_state = (params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius)
+    initial_runner_state = (params, seer_carry, doer_carry, env_state, env_obs, rng, vision_radius, global_layout_keys)
     
     # 1. Execute the scan loop to collect the raw trajectory
     final_runner_state, trajectory_batch = jax.lax.scan(
@@ -166,7 +169,7 @@ def generate_trajectory_and_gae(
     
     # 2. Extract the final state for Critic bootstrapping
     # Unpack the final runner state to get the last env_obs
-    _, _, _, _, final_env_obs, _, _ = final_runner_state
+    _, _, _, _, final_env_obs, _, _, next_global_layout_key = final_runner_state
     
     # Enforce CTDE: The critic evaluates the global map 
     final_global_map = final_env_obs["global_map"]
