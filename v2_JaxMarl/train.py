@@ -558,12 +558,13 @@ def save_two_doer_initial_visualization(env, state, config):
     output_path = Path(config["visualize_dir"]) / "two_doer_initial_layout.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame = env.render(state)
-    Image.fromarray(frame).resize((frame.shape[1] * 32, frame.shape[0] * 32), resample=Image.NEAREST).save(
-        output_path
-    )
+    Image.fromarray(frame).save(output_path)
     wandb.log(
-        {"two_doer_initial_layout": wandb.Image(str(output_path))},
-        commit=False,
+        {
+            "two_doer_initial_layout": wandb.Image(str(output_path)),
+            "two_doer_initial_layout_step": 0,
+        },
+        commit=True,
     )
     print(f"Initial two-doer layout saved to {output_path}")
     return output_path
@@ -578,6 +579,15 @@ def print_two_doer_start_positions_banner(fixed_positions, label="TWO-DOER START
         f"Doer A: ({positions_np[0][0]}, {positions_np[0][1]}) | "
         f"Doer B: ({positions_np[1][0]}, {positions_np[1][1]})"
     )
+    print("=" * 72)
+    print("")
+
+
+def print_two_doer_perception_level_banner(level, label="TWO-DOER PERCEPTION LEVEL"):
+    print("")
+    print("=" * 72)
+    print(label)
+    print(f"doer_perception_level={level}")
     print("=" * 72)
     print("")
 
@@ -611,12 +621,7 @@ def visualize_two_doer_episode(
 
     while not bool(done) and step_count < config["episode_max_steps"]:
         frame = env.render(state)
-        frames.append(
-            Image.fromarray(frame).resize(
-                (frame.shape[1] * 32, frame.shape[0] * 32),
-                resample=Image.NEAREST,
-            )
-        )
+        frames.append(Image.fromarray(frame))
 
         global_map = obs["global_map"][None, ...]
         symbolic_state = obs["symbolic_state"][None, ...]
@@ -678,8 +683,9 @@ def visualize_two_doer_episode(
             {
                 "two_doer_eval_episode": wandb.Video(str(output_path), format="gif"),
                 "two_doer_eval_episode_solved": int(success),
+                "two_doer_eval_episode_step": int(update),
             },
-            commit=False,
+            commit=True,
         )
         print(f"Two-doer eval episode saved to {output_path}")
 
@@ -701,6 +707,7 @@ def run_two_doer_training(config):
         step_penalty=config["step_penalty"],
         wall_penalty=config["wall_penalty"],
         collision_penalty=config["collision_penalty"],
+        doer_perception_level=config["doer_perception_level"],
     )
     curriculum_active = config["use_two_doer_start_curriculum"]
     current_start_success_streak = 0
@@ -709,6 +716,10 @@ def run_two_doer_training(config):
     if curriculum_active:
         rng, fixed_positions = sample_two_doer_curriculum_anchor(env, rng)
         print_two_doer_start_positions_banner(fixed_positions, label="INITIAL TWO-DOER STARTS")
+    print_two_doer_perception_level_banner(
+        env.doer_perception_level,
+        label="INITIAL TWO-DOER PERCEPTION LEVEL",
+    )
 
     rng, env_obs, env_state = reset_two_doer_batch(
         env,
@@ -846,6 +857,7 @@ def run_two_doer_training(config):
             wandb.log(
                 {
                     "task_variant": config["task_variant"],
+                    "doer_perception_level": env.doer_perception_level,
                     "curriculum_fixed_starts": int(curriculum_active),
                     "current_start_success_streak": current_start_success_streak,
                     "mastered_start_positions": mastered_start_positions,
@@ -925,6 +937,13 @@ def run_two_doer_training(config):
                     if mastered_start_positions >= config["two_doer_required_start_positions"]:
                         curriculum_active = False
                         fixed_positions = UNSET_TWO_DOER_POSITIONS
+                        if env.doer_perception_level < config["max_doer_perception_level"]:
+                            env.doer_perception_level = config["max_doer_perception_level"]
+                            config["doer_perception_level"] = env.doer_perception_level
+                            print_two_doer_perception_level_banner(
+                                env.doer_perception_level,
+                                label="NEW TWO-DOER PERCEPTION LEVEL",
+                            )
                         print("")
                         print("=" * 72)
                         print("TWO-DOER CURRICULUM COMPLETE: random starts enabled")

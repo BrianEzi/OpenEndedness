@@ -29,6 +29,8 @@ class TwoDoerBottleneckEnv:
         step_penalty: float = 0.03,
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
+        doer_perception_level: int = 2,
+        render_tile_size: int = 24,
     ):
         if grid_height < 8:
             raise ValueError("grid_height must be >= 8.")
@@ -51,6 +53,8 @@ class TwoDoerBottleneckEnv:
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
+        self.doer_perception_level = int(doer_perception_level)
+        self.render_tile_size = int(render_tile_size)
         self.num_doers = 2
         self._view_radius = self.local_view_size // 2
         self._inner_width = self.grid_width - 2
@@ -139,13 +143,38 @@ class TwoDoerBottleneckEnv:
 
     def _split_observations(self, state: TwoDoerState):
         global_map = self._compose_global_map(state)
-        local_views = self._extract_local_views(global_map, state.positions)
+        full_local_views = self._extract_local_views(global_map, state.positions)
         goals_reached = jnp.all(state.positions == state.goals, axis=-1).astype(jnp.float32)
         agent_identity = jnp.eye(self.num_doers, dtype=jnp.float32)
-        proprioceptions = jnp.concatenate(
-            [agent_identity, goals_reached[:, None]],
+        position_features = jnp.stack(
+            [
+                state.positions[:, 0].astype(jnp.float32) / float(self.grid_height - 1),
+                state.positions[:, 1].astype(jnp.float32) / float(self.grid_width - 1),
+            ],
             axis=-1,
         )
+        proprioception_full = jnp.concatenate(
+            [position_features, agent_identity, goals_reached[:, None]],
+            axis=-1,
+        )
+        if self.doer_perception_level == 2:
+            local_views = jnp.zeros_like(full_local_views)
+            proprioceptions = proprioception_full
+        elif self.doer_perception_level == 3:
+            local_views = jnp.zeros_like(full_local_views)
+            proprioceptions = jnp.concatenate(
+                [
+                    jnp.zeros_like(position_features),
+                    agent_identity,
+                    jnp.zeros_like(goals_reached[:, None]),
+                ],
+                axis=-1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported doer_perception_level={self.doer_perception_level}. "
+                "Use 2 or 3."
+            )
         symbolic_state = jnp.concatenate(
             [
                 jnp.asarray(
@@ -336,19 +365,53 @@ class TwoDoerBottleneckEnv:
         return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, actions, fixed_positions)
 
     def render(self, state: TwoDoerState) -> np.ndarray:
-        frame = np.ones((self.grid_height, self.grid_width, 3), dtype=np.float32) * 0.96
-        frame[np.asarray(self._wall_map)] = np.array([0.18, 0.18, 0.22], dtype=np.float32)
+        tile = self.render_tile_size
+        frame = np.ones((self.grid_height * tile, self.grid_width * tile, 3), dtype=np.float32) * 0.96
+
+        wall_color = np.array([0.18, 0.18, 0.22], dtype=np.float32)
+        corridor_color = np.array([0.98, 0.88, 0.45], dtype=np.float32)
+
+        wall_map = np.asarray(self._wall_map)
+        for row in range(self.grid_height):
+            for col in range(self.grid_width):
+                y0 = row * tile
+                y1 = (row + 1) * tile
+                x0 = col * tile
+                x1 = (col + 1) * tile
+                if wall_map[row, col]:
+                    frame[y0:y1, x0:x1] = wall_color
+
+        for col in range(self._corridor_start_col, self._corridor_end_col):
+            y0 = self._corridor_row * tile
+            y1 = (self._corridor_row + 1) * tile
+            x0 = col * tile
+            x1 = (col + 1) * tile
+            frame[y0:y1, x0:x1] = corridor_color
 
         for agent_idx in range(self.num_doers):
             goal_row, goal_col = np.asarray(state.goals[agent_idx]).tolist()
-            frame[goal_row, goal_col] = np.asarray(self._goal_colors[agent_idx])
+            y0 = goal_row * tile
+            x0 = goal_col * tile
+            inset = max(tile // 4, 2)
+            frame[
+                y0 + inset:(goal_row + 1) * tile - inset,
+                x0 + inset:(goal_col + 1) * tile - inset,
+            ] = np.asarray(self._agent_colors[agent_idx])
+
+        yy, xx = np.mgrid[0:tile, 0:tile]
+        left_triangle = np.logical_and(xx >= tile // 5, np.abs(yy - tile // 2) <= xx - tile // 5)
+        right_triangle = np.logical_and(
+            xx <= tile - tile // 5 - 1,
+            np.abs(yy - tile // 2) <= (tile - tile // 5 - 1) - xx,
+        )
 
         for agent_idx in range(self.num_doers):
             row, col = np.asarray(state.positions[agent_idx]).tolist()
-            frame[row, col] = np.asarray(self._agent_colors[agent_idx])
+            y0 = row * tile
+            x0 = col * tile
+            tile_view = frame[y0:(row + 1) * tile, x0:(col + 1) * tile]
+            triangle_mask = left_triangle if agent_idx == 0 else right_triangle
+            tile_view[triangle_mask] = np.asarray(self._agent_colors[agent_idx])
+            frame[y0:(row + 1) * tile, x0:(col + 1) * tile] = tile_view
 
-        frame[
-            self._corridor_row,
-            self._corridor_start_col:self._corridor_end_col,
-        ] = np.array([0.98, 0.88, 0.45], dtype=np.float32)
         return (frame * 255.0).astype(np.uint8)
