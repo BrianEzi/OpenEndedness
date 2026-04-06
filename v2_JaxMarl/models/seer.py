@@ -14,6 +14,7 @@ class Seer(nn.Module):
     fsq_levels: Sequence[int]
     num_actions: int = 3
     lstm_features: int = 128
+    num_message_heads: int = 1
 
     @nn.compact
     def __call__(
@@ -62,14 +63,23 @@ class Seer(nn.Module):
         # Project LSTM hidden state to continuous vector z of size d.
         # Use Orthogonal init with higher scale to prevent FSQ mode collapse.
         thought_vector = nn.Dense(
-            features=len(self.fsq_levels),
+            features=len(self.fsq_levels) * self.num_message_heads,
             kernel_init=nn.initializers.orthogonal(scale=2.0)
         )(lstm_out)
-        
+        thought_vector = thought_vector.reshape(
+            (thought_vector.shape[0], self.num_message_heads, len(self.fsq_levels))
+        )
+
         # 6. Output Head: FSQ Discretizer 
         # Transforms the continuous thought vector into the discrete message $m_t$ 
         fsq = FSQ(levels=self.fsq_levels)
-        discrete_message = fsq(thought_vector)
+        discrete_message = fsq(
+            thought_vector.reshape((-1, thought_vector.shape[-1]))
+        ).reshape(thought_vector.shape)
+
+        if self.num_message_heads == 1:
+            thought_vector = thought_vector[:, 0, :]
+            discrete_message = discrete_message[:, 0, :]
 
         # During the pretraining phase the Seer physically navigates the grid.
         navigation_logits = nn.Dense(features=self.num_actions)(lstm_out)

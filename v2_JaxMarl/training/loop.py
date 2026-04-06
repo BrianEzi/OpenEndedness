@@ -5,7 +5,7 @@ from typing import Tuple, Any, Dict
 from training.gae import compute_gae 
 
 # Assuming Transition is imported from your mappo.py or a shared datatypes file
-from agents.mappo import Transition 
+from agents.mappo import Transition, TwoDoerTransition
 from eval.metrics import compute_cic
 
 def make_rollout_step(
@@ -293,4 +293,160 @@ def generate_trajectory_and_gae(
         return_val=returns
     )
     
+    return final_runner_state, trajectory_batch
+
+
+def make_two_doer_rollout_step(
+    env,
+    seer_apply_fn,
+    doer_apply_fn,
+    critic_apply_fn,
+):
+    """Rollout step for one Seer coordinating two embodied Doers."""
+
+    def rollout_step(runner_state: Tuple, _):
+        params, seer_carry, doer_carry, env_state, env_obs, rng = runner_state
+        num_envs = env_obs["global_map"].shape[0]
+        global_map = env_obs["global_map"]
+        symbolic_obs = env_obs["symbolic_state"]
+        local_obs = env_obs["local_views"]
+        proprioception = env_obs["proprioceptions"]
+
+        rng, action_rng, env_rng = jax.random.split(rng, 3)
+        env_step_keys = jax.random.split(env_rng, num_envs)
+
+        next_seer_carry, discrete_messages, _, _ = seer_apply_fn(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_obs,
+        )
+
+        batch_size, num_doers = local_obs.shape[:2]
+        flat_local_obs = local_obs.reshape((batch_size * num_doers,) + local_obs.shape[2:])
+        flat_proprioception = proprioception.reshape(
+            (batch_size * num_doers,) + proprioception.shape[2:]
+        )
+        flat_messages = discrete_messages.reshape(
+            (batch_size * num_doers,) + discrete_messages.shape[2:]
+        )
+        flat_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size * num_doers,) + x.shape[2:]),
+            doer_carry,
+        )
+        next_flat_doer_carry, flat_logits = doer_apply_fn(
+            {"params": params["doer"]},
+            flat_doer_carry,
+            flat_local_obs,
+            flat_proprioception,
+            flat_messages,
+        )
+        next_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
+            next_flat_doer_carry,
+        )
+        doer_logits = flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))
+        doer_pi = distrax.Categorical(logits=doer_logits)
+        doer_action = doer_pi.sample(seed=action_rng)
+        doer_log_prob = doer_pi.log_prob(doer_action)
+        value = critic_apply_fn({"params": params["critic"]}, global_map).squeeze(-1)
+
+        next_env_obs, next_env_state, reward, done, info = env.step_batch(
+            env_step_keys,
+            env_state,
+            doer_action,
+        )
+
+        next_seer_carry = jax.tree_util.tree_map(
+            lambda x: jnp.where(done[:, None], jnp.zeros_like(x), x),
+            next_seer_carry,
+        )
+        next_doer_carry = jax.tree_util.tree_map(
+            lambda x: jnp.where(done[:, None, None], jnp.zeros_like(x), x),
+            next_doer_carry,
+        )
+
+        transition = TwoDoerTransition(
+            global_obs=global_map,
+            symbolic_obs=symbolic_obs,
+            local_obs=local_obs,
+            proprioception=proprioception,
+            message=discrete_messages,
+            doer_action=doer_action,
+            doer_log_prob=doer_log_prob,
+            value=value,
+            reward=reward,
+            task_reward=info["task_reward"],
+            progress_reward_per_doer=info["progress_reward_per_doer"],
+            step_penalty_component=info["step_penalty"],
+            wall_penalty_component=info["wall_penalty"],
+            collision_penalty_component=info["collision_penalty"],
+            done=done,
+            advantage=jnp.zeros_like(reward),
+            return_val=jnp.zeros_like(reward),
+        )
+
+        next_runner_state = (
+            params,
+            next_seer_carry,
+            next_doer_carry,
+            next_env_state,
+            next_env_obs,
+            rng,
+        )
+        return next_runner_state, transition
+
+    return rollout_step
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=("num_steps", "step_fn", "critic_apply_fn"),
+)
+def generate_two_doer_trajectory_and_gae(
+    params,
+    rng,
+    env_obs,
+    env_state,
+    seer_carry,
+    doer_carry,
+    num_steps: int,
+    step_fn,
+    critic_apply_fn,
+):
+    initial_runner_state = (
+        params,
+        seer_carry,
+        doer_carry,
+        env_state,
+        env_obs,
+        rng,
+    )
+    final_runner_state, trajectory_batch = jax.lax.scan(
+        step_fn,
+        initial_runner_state,
+        None,
+        length=num_steps,
+    )
+    _, _, _, _, final_env_obs, _ = final_runner_state
+    last_val = critic_apply_fn(
+        {"params": params["critic"]},
+        final_env_obs["global_map"],
+    ).squeeze(-1)
+    advantages, returns = jax.vmap(
+        compute_gae,
+        in_axes=(1, 1, 1, 0, None, None),
+        out_axes=1,
+    )(
+        trajectory_batch.reward,
+        trajectory_batch.value,
+        trajectory_batch.done,
+        last_val,
+        0.99,
+        0.95,
+    )
+    trajectory_batch = trajectory_batch.replace(
+        advantage=advantages,
+        return_val=returns,
+    )
     return final_runner_state, trajectory_batch
