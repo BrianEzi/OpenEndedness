@@ -410,7 +410,7 @@ class TwoDoerBottleneckEnv:
             y0 = row * tile
             x0 = col * tile
             tile_view = frame[y0:(row + 1) * tile, x0:(col + 1) * tile]
-            triangle_mask = left_triangle if agent_idx == 0 else right_triangle
+            triangle_mask = right_triangle if agent_idx == 0 else left_triangle
             tile_view[triangle_mask] = np.asarray(self._agent_colors[agent_idx])
             frame[y0:(row + 1) * tile, x0:(col + 1) * tile] = tile_view
 

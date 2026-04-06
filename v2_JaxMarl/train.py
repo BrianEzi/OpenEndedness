@@ -690,7 +690,10 @@ def run_two_doer_training(config):
         collision_penalty=config["collision_penalty"],
         doer_perception_level=config["doer_perception_level"],
     )
-    curriculum_active = config["use_two_doer_start_curriculum"]
+    curriculum_active = (
+        config["use_two_doer_start_curriculum"]
+        and not config["two_doer_random_starts_only"]
+    )
     current_start_success_streak = 0
     mastered_start_positions = 0
     fixed_positions = UNSET_TWO_DOER_POSITIONS
@@ -1007,9 +1010,10 @@ def main():
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
         "eval_every": 300,
-        "curriculum_rollout_success_threshold": 0.99,
+        "curriculum_rollout_success_threshold": 0.97,
         "visualize_every": 200,
         "use_two_doer_start_curriculum": True,
+        "two_doer_random_starts_only": False,
         "two_doer_required_start_positions": 3,
         "use_seer_nav_phase": False,
         "seer_required_start_positions": 5,
