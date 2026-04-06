@@ -734,7 +734,7 @@ def main():
         "episode_max_steps": 48,
         "goal_reward": 1.0,
         "follow_reward_scale": 0.1,
-        "progress_reward_scale": 0.05,
+        "progress_reward_scale": 0.1,
         "cic_coef": 0.01,
         "seer_entropy_coef": 0.05,
         "doer_perception_level": 2,
