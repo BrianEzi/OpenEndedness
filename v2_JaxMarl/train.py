@@ -299,7 +299,7 @@ def sample_two_doer_curriculum_anchor(
     raise RuntimeError("Failed to sample a new two-doer curriculum start configuration.")
 
 
-def evaluate_two_doer_greedy_episode(
+def _run_two_doer_greedy_episode(
     env,
     params,
     rng,
@@ -307,7 +307,9 @@ def evaluate_two_doer_greedy_episode(
     doer,
     max_steps,
     fixed_positions=UNSET_TWO_DOER_POSITIONS,
+    capture_trace=False,
 ):
+    action_labels = ("stay", "up", "right", "down", "left")
     rng, reset_rng = jax.random.split(rng)
     obs, state = env.reset(reset_rng, fixed_positions=fixed_positions)
 
@@ -316,6 +318,7 @@ def evaluate_two_doer_greedy_episode(
     done = False
     success = False
     step_count = 0
+    trace_lines = []
 
     while not bool(done) and step_count < max_steps:
         global_map = obs["global_map"][None, ...]
@@ -356,6 +359,27 @@ def evaluate_two_doer_greedy_episode(
             axis=-1,
         ).astype(jnp.int32)
 
+        if capture_trace:
+            positions = np.asarray(state.positions).tolist()
+            message_np = np.asarray(messages[0]).round(3).tolist()
+            action_names = [
+                action_labels[int(action)] if int(action) < len(action_labels) else str(int(action))
+                for action in np.asarray(actions).tolist()
+            ]
+            trace_lines.append(
+                " ".join(
+                    [
+                        f"t={step_count:02d}",
+                        f"pos_a={positions[0]}",
+                        f"pos_b={positions[1]}",
+                        f"msg_a={message_np[0]}",
+                        f"act_a={action_names[0]}",
+                        f"msg_b={message_np[1]}",
+                        f"act_b={action_names[1]}",
+                    ]
+                )
+            )
+
         rng, step_rng = jax.random.split(rng)
         obs, state, _, done, info = env.step(
             step_rng,
@@ -366,6 +390,31 @@ def evaluate_two_doer_greedy_episode(
         success = success or bool(info["success"])
         step_count += 1
 
+    if capture_trace:
+        final_status = "solved" if bool(info["success"]) else "stopped"
+        trace_lines.append(f"end={final_status} steps={step_count}")
+    return rng, success, trace_lines
+
+
+def evaluate_two_doer_greedy_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    max_steps,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+):
+    rng, success, _ = _run_two_doer_greedy_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        max_steps,
+        fixed_positions=fixed_positions,
+        capture_trace=False,
+    )
     return rng, success
 
 
@@ -378,84 +427,16 @@ def collect_two_doer_message_action_trace(
     max_steps,
     fixed_positions=UNSET_TWO_DOER_POSITIONS,
 ):
-    action_labels = ("stay", "up", "right", "down", "left")
-    rng, reset_rng = jax.random.split(rng)
-    obs, state = env.reset(reset_rng, fixed_positions=fixed_positions)
-
-    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
-    doer_carry = initialize_two_doer_carry(doer, num_envs=1, num_doers=env.num_doers, hidden_size=128)
-    trace_lines = []
-    done = False
-    step_count = 0
-
-    while not bool(done) and step_count < max_steps:
-        global_map = obs["global_map"][None, ...]
-        symbolic_state = obs["symbolic_state"][None, ...]
-        local_views = obs["local_views"][None, ...]
-        proprioceptions = obs["proprioceptions"][None, ...]
-
-        seer_carry, messages, _, _ = seer.apply(
-            {"params": params["seer"]},
-            seer_carry,
-            global_map,
-            symbolic_state,
-        )
-
-        batch_size, num_doers = local_views.shape[:2]
-        flat_local_views = local_views.reshape((batch_size * num_doers,) + local_views.shape[2:])
-        flat_proprioceptions = proprioceptions.reshape(
-            (batch_size * num_doers,) + proprioceptions.shape[2:]
-        )
-        flat_messages = messages.reshape((batch_size * num_doers,) + messages.shape[2:])
-        flat_doer_carry = jax.tree_util.tree_map(
-            lambda x: x.reshape((batch_size * num_doers,) + x.shape[2:]),
-            doer_carry,
-        )
-        next_flat_doer_carry, flat_logits = doer.apply(
-            {"params": params["doer"]},
-            flat_doer_carry,
-            flat_local_views,
-            flat_proprioceptions,
-            flat_messages,
-        )
-        doer_carry = jax.tree_util.tree_map(
-            lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
-            next_flat_doer_carry,
-        )
-        logits = flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))[0]
-        actions = jnp.argmax(logits, axis=-1).astype(jnp.int32)
-
-        positions = np.asarray(state.positions).tolist()
-        message_np = np.asarray(messages[0]).round(3).tolist()
-        action_names = [
-            action_labels[int(action)] if int(action) < len(action_labels) else str(int(action))
-            for action in np.asarray(actions).tolist()
-        ]
-        trace_lines.append(
-            " ".join(
-                [
-                    f"t={step_count:02d}",
-                    f"pos_a={positions[0]}",
-                    f"pos_b={positions[1]}",
-                    f"msg_a={message_np[0]}",
-                    f"act_a={action_names[0]}",
-                    f"msg_b={message_np[1]}",
-                    f"act_b={action_names[1]}",
-                ]
-            )
-        )
-
-        rng, step_rng = jax.random.split(rng)
-        obs, state, _, done, info = env.step(
-            step_rng,
-            state,
-            actions,
-            fixed_positions=fixed_positions,
-        )
-        step_count += 1
-
-    final_status = "solved" if bool(info["success"]) else "stopped"
-    trace_lines.append(f"end={final_status} steps={step_count}")
+    rng, _, trace_lines = _run_two_doer_greedy_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        max_steps,
+        fixed_positions=fixed_positions,
+        capture_trace=True,
+    )
     return rng, trace_lines
 
 
@@ -860,6 +841,7 @@ def run_two_doer_training(config):
                     "doer_perception_level": env.doer_perception_level,
                     "curriculum_fixed_starts": int(curriculum_active),
                     "current_start_success_streak": current_start_success_streak,
+                    "curriculum_eval_batch_successes": current_start_success_streak,
                     "mastered_start_positions": mastered_start_positions,
                     "rollout_success_rate": rollout_success_rate,
                     "team_reward": trajectory_batch.reward.mean(),
@@ -883,7 +865,7 @@ def run_two_doer_training(config):
             print(
                 f"Update {update}/{num_updates} | "
                 f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
-                f"Streak: {current_start_success_streak} | "
+                f"EvalBatch: {current_start_success_streak}/{config['curriculum_eval_episodes']} | "
                 f"Mastered: {mastered_start_positions}/"
                 f"{config['two_doer_required_start_positions']} | "
                 f"SuccessRate: {float(rollout_success_rate):.3f} | "
@@ -903,34 +885,53 @@ def run_two_doer_training(config):
             )
 
         if update > 0 and update % config["eval_every"] == 0:
-            rng, greedy_solved = evaluate_two_doer_greedy_episode(
-                env,
-                params,
-                rng,
-                seer,
-                doer,
-                config["episode_max_steps"],
-                fixed_positions=fixed_positions,
+            eval_successes = 0
+            trace_lines = None
+            for eval_idx in range(config["curriculum_eval_episodes"]):
+                if eval_idx == 0:
+                    rng, greedy_solved, trace_lines = _run_two_doer_greedy_episode(
+                        env,
+                        params,
+                        rng,
+                        seer,
+                        doer,
+                        config["episode_max_steps"],
+                        fixed_positions=fixed_positions,
+                        capture_trace=True,
+                    )
+                else:
+                    rng, greedy_solved = evaluate_two_doer_greedy_episode(
+                        env,
+                        params,
+                        rng,
+                        seer,
+                        doer,
+                        config["episode_max_steps"],
+                        fixed_positions=fixed_positions,
+                    )
+                eval_successes += int(greedy_solved)
+                wandb.log(
+                    {f"greedy_episode_solved_{eval_idx + 1}": int(greedy_solved)},
+                    commit=False,
+                )
+            current_start_success_streak = eval_successes
+            greedy_solved = eval_successes == config["curriculum_eval_episodes"]
+            wandb.log(
+                {
+                    "greedy_episode_solved": int(greedy_solved),
+                    "curriculum_eval_batch_successes": eval_successes,
+                }
             )
-            wandb.log({"greedy_episode_solved": int(greedy_solved)})
-            print(f"Greedy eval @ {update}: solved={int(greedy_solved)}")
-            rng = print_two_doer_communication_trace(
-                env,
-                params,
-                rng,
-                seer,
-                doer,
-                config["episode_max_steps"],
-                f"update_{update}",
-                fixed_positions=fixed_positions,
+            print(
+                f"Greedy eval @ {update}: "
+                f"{eval_successes}/{config['curriculum_eval_episodes']} successful"
             )
+            print(f"Two-doer communication trace (update_{update}):")
+            for line in trace_lines:
+                print(line)
 
             if curriculum_active:
-                current_start_success_streak = (
-                    current_start_success_streak + 1 if greedy_solved else 0
-                )
-                if current_start_success_streak >= config["curriculum_success_streak"]:
-                    current_start_success_streak = 0
+                if greedy_solved:
                     mastered_start_positions += 1
                     previous_fixed_positions = fixed_positions
 
@@ -973,6 +974,8 @@ def run_two_doer_training(config):
                         num_doers=env.num_doers,
                         hidden_size=128,
                     )
+                else:
+                    current_start_success_streak = 0
 
         if update > 0 and update % config["visualize_every"] == 0:
             rng, _, _ = visualize_two_doer_episode(
@@ -1012,10 +1015,11 @@ def main():
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
-        "eval_every": 200,
+        "eval_every": 300,
+        "curriculum_eval_episodes": 3,
         "visualize_every": 200,
         "use_two_doer_start_curriculum": True,
-        "two_doer_required_start_positions": 5,
+        "two_doer_required_start_positions": 3,
         "use_seer_nav_phase": False,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
