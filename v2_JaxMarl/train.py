@@ -27,6 +27,7 @@ import navix as nx
 from eval.visualize import visualize_episode
 import numpy as np
 import wandb
+from PIL import Image
 
 
 # For the sake of a complete script, here is a pragmatic, standard Critic
@@ -409,6 +410,21 @@ def log_curriculum_visualization(
     )
 
 
+def save_two_doer_initial_visualization(env, state, config):
+    output_path = Path(config["visualize_dir"]) / "two_doer_initial_layout.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame = env.render(state)
+    Image.fromarray(frame).resize((frame.shape[1] * 32, frame.shape[0] * 32), resample=Image.NEAREST).save(
+        output_path
+    )
+    wandb.log(
+        {"two_doer_initial_layout": wandb.Image(str(output_path))},
+        commit=False,
+    )
+    print(f"Initial two-doer layout saved to {output_path}")
+    return output_path
+
+
 def run_two_doer_training(config):
     rng = jax.random.PRNGKey(config["seed"])
     rng, seer_init_rng, doer_init_rng, critic_init_rng, reset_rng = jax.random.split(rng, 5)
@@ -425,6 +441,7 @@ def run_two_doer_training(config):
     )
     reset_keys = jax.random.split(reset_rng, config["num_envs"])
     env_obs, env_state = env.reset_batch(reset_keys)
+    save_two_doer_initial_visualization(env, jax.tree_util.tree_map(lambda x: x[0], env_state), config)
 
     seer = Seer(
         fsq_levels=config["fsq_levels"],
@@ -616,7 +633,7 @@ def main():
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
         "eval_every": 25,
-        "use_seer_nav_phase": True,
+        "use_seer_nav_phase": False,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
         "release_goal_after_max_level": True,
