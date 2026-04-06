@@ -840,8 +840,9 @@ def run_two_doer_training(config):
                     "task_variant": config["task_variant"],
                     "doer_perception_level": env.doer_perception_level,
                     "curriculum_fixed_starts": int(curriculum_active),
-                    "current_start_success_streak": current_start_success_streak,
-                    "curriculum_eval_batch_successes": current_start_success_streak,
+                    "curriculum_eval_gate_passed": int(
+                        rollout_success_rate >= config["curriculum_rollout_success_threshold"]
+                    ),
                     "mastered_start_positions": mastered_start_positions,
                     "rollout_success_rate": rollout_success_rate,
                     "team_reward": trajectory_batch.reward.mean(),
@@ -865,7 +866,7 @@ def run_two_doer_training(config):
             print(
                 f"Update {update}/{num_updates} | "
                 f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
-                f"EvalBatch: {current_start_success_streak}/{config['curriculum_eval_episodes']} | "
+                f"EvalGate: {int(rollout_success_rate >= config['curriculum_rollout_success_threshold'])} | "
                 f"Mastered: {mastered_start_positions}/"
                 f"{config['two_doer_required_start_positions']} | "
                 f"SuccessRate: {float(rollout_success_rate):.3f} | "
@@ -885,52 +886,40 @@ def run_two_doer_training(config):
             )
 
         if update > 0 and update % config["eval_every"] == 0:
-            eval_successes = 0
-            trace_lines = None
-            for eval_idx in range(config["curriculum_eval_episodes"]):
-                if eval_idx == 0:
-                    rng, greedy_solved, trace_lines = _run_two_doer_greedy_episode(
-                        env,
-                        params,
-                        rng,
-                        seer,
-                        doer,
-                        config["episode_max_steps"],
-                        fixed_positions=fixed_positions,
-                        capture_trace=True,
-                    )
-                else:
-                    rng, greedy_solved = evaluate_two_doer_greedy_episode(
-                        env,
-                        params,
-                        rng,
-                        seer,
-                        doer,
-                        config["episode_max_steps"],
-                        fixed_positions=fixed_positions,
-                    )
-                eval_successes += int(greedy_solved)
-                wandb.log(
-                    {f"greedy_episode_solved_{eval_idx + 1}": int(greedy_solved)},
-                    commit=False,
+            gate_passed = bool(
+                float(rollout_success_rate) >= config["curriculum_rollout_success_threshold"]
+            )
+            greedy_solved = False
+            if gate_passed:
+                rng, greedy_solved, trace_lines = _run_two_doer_greedy_episode(
+                    env,
+                    params,
+                    rng,
+                    seer,
+                    doer,
+                    config["episode_max_steps"],
+                    fixed_positions=fixed_positions,
+                    capture_trace=True,
                 )
-                if not greedy_solved:
-                    break
-            current_start_success_streak = eval_successes
-            greedy_solved = eval_successes == config["curriculum_eval_episodes"]
+                print(
+                    f"Greedy eval @ {update}: "
+                    f"gate_passed=1 solved={int(greedy_solved)}"
+                )
+                print(f"Two-doer communication trace (update_{update}):")
+                for line in trace_lines:
+                    print(line)
+            else:
+                print(
+                    f"Greedy eval @ {update}: "
+                    f"gate_passed=0 skipped "
+                    f"(rollout_success_rate={float(rollout_success_rate):.3f})"
+                )
             wandb.log(
                 {
+                    "curriculum_eval_gate_passed": int(gate_passed),
                     "greedy_episode_solved": int(greedy_solved),
-                    "curriculum_eval_batch_successes": eval_successes,
                 }
             )
-            print(
-                f"Greedy eval @ {update}: "
-                f"{eval_successes}/{config['curriculum_eval_episodes']} successful"
-            )
-            print(f"Two-doer communication trace (update_{update}):")
-            for line in trace_lines:
-                print(line)
 
             if curriculum_active:
                 if greedy_solved:
@@ -1018,7 +1007,7 @@ def main():
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
         "eval_every": 300,
-        "curriculum_eval_episodes": 3,
+        "curriculum_rollout_success_threshold": 0.99,
         "visualize_every": 200,
         "use_two_doer_start_curriculum": True,
         "two_doer_required_start_positions": 3,
