@@ -154,6 +154,38 @@ def collect_message_action_trace(
     return rng, trace_lines
 
 
+def print_communication_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+    label,
+):
+    rng, trace_rng = jax.random.split(rng)
+    rng, trace_lines = collect_message_action_trace(
+        env,
+        params,
+        trace_rng,
+        seer,
+        doer,
+        vision_radius,
+        max_steps,
+        control_mode,
+        fixed_goal_position,
+        fixed_start_position,
+    )
+    print(f"Communication trace ({label}):")
+    for line in trace_lines:
+        print(line)
+    return rng
+
+
 def evaluate_greedy_episode(
     env,
     params,
@@ -314,7 +346,6 @@ def main():
         "min_start_distance": 1.0,
         "step_penalty": 0.01,
         "bump_penalty": 0.1,
-        "message_trace_every": 100,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
     }
@@ -508,7 +539,6 @@ def main():
         
         # D. Logging
         if update % 10 == 0:
-            in_communication_phase = int(control_mode) == env.COMMUNICATION_PHASE
             if int(control_mode) == env.SEER_NAV_PHASE:
                 phase_label = "seer_nav"
             elif goal_randomization_enabled:
@@ -563,27 +593,6 @@ def main():
                 f"CIC: {cic_score:.3f}"
             )
             
-            if (
-                in_communication_phase
-                and update % config["message_trace_every"] == 0
-            ):
-                rng, trace_rng = jax.random.split(rng)
-                rng, trace_lines = collect_message_action_trace(
-                    env,
-                    params,
-                    trace_rng,
-                    seer,
-                    doer,
-                    vision_radius,
-                    config["visualize_max_steps"],
-                    control_mode,
-                    fixed_goal_position,
-                    fixed_start_position,
-                )
-                print("Communication trace:")
-                for line in trace_lines:
-                    print(line)
-
         if update > 0 and update % config["curriculum_eval_every"] == 0:
             rng, greedy_solved = evaluate_greedy_episode(
                 env,
@@ -670,6 +679,20 @@ def main():
                         >= config["communication_start_positions_per_level"]
                     ):
                         communication_mastered_starts = 0
+                        mastered_sublevel = config["doer_perception_level"]
+                        rng = print_communication_trace(
+                            env,
+                            params,
+                            rng,
+                            seer,
+                            doer,
+                            vision_radius,
+                            config["visualize_max_steps"],
+                            control_mode,
+                            fixed_goal_position,
+                            fixed_start_position,
+                            f"mastered_level_{mastered_sublevel}",
+                        )
                         if config["doer_perception_level"] < config["max_doer_perception_level"]:
                             config["doer_perception_level"] += 1
                             env.doer_perception_level = config["doer_perception_level"]
