@@ -53,11 +53,20 @@ class TwoDoerBottleneckEnv:
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
         self.num_doers = 2
         self._view_radius = self.local_view_size // 2
+        self._inner_width = self.grid_width - 2
+        self._room_width = (self._inner_width - self.corridor_length) // 2
+        self._extra_width = self._inner_width - self.corridor_length - 2 * self._room_width
+        self._left_room_start_col = 1
+        self._left_room_end_col = self._left_room_start_col + self._room_width
         self._corridor_row = self.grid_height // 2
-        self._corridor_start_col = (self.grid_width - self.corridor_length) // 2
+        self._corridor_start_col = self._left_room_end_col
         self._corridor_end_col = self._corridor_start_col + self.corridor_length
+        self._right_room_start_col = self._corridor_end_col
+        self._right_room_end_col = self._right_room_start_col + self._room_width
+        self._extra_wall_start_col = self._right_room_end_col
+        self._extra_wall_end_col = self.grid_width - 1
         self._left_col = 1
-        self._right_col = self.grid_width - 2
+        self._right_col = self._right_room_end_col - 1
         self._candidate_rows = jnp.asarray([1, 2, self.grid_height - 3, self.grid_height - 2], dtype=jnp.int32)
         self._wall_map = self._build_wall_map()
         self._goal_colors = jnp.asarray(
@@ -89,6 +98,9 @@ class TwoDoerBottleneckEnv:
         corridor_cols = jnp.arange(self._corridor_start_col, self._corridor_end_col)
         wall_map = wall_map.at[:, corridor_cols].set(True)
         wall_map = wall_map.at[self._corridor_row, corridor_cols].set(False)
+        if self._extra_width > 0:
+            extra_cols = jnp.arange(self._extra_wall_start_col, self._extra_wall_end_col)
+            wall_map = wall_map.at[:, extra_cols].set(True)
         return wall_map
 
     @staticmethod
