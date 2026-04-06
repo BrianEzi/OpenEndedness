@@ -425,6 +425,104 @@ def save_two_doer_initial_visualization(env, state, config):
     return output_path
 
 
+def visualize_two_doer_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    config,
+    update,
+):
+    output_path = Path(config["visualize_dir"]) / f"two_doer_eval_{update:05d}.gif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(reset_rng)
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = initialize_two_doer_carry(
+        doer,
+        num_envs=1,
+        num_doers=env.num_doers,
+        hidden_size=128,
+    )
+    done = False
+    step_count = 0
+    success = False
+    frames = []
+
+    while not bool(done) and step_count < config["episode_max_steps"]:
+        frame = env.render(state)
+        frames.append(
+            Image.fromarray(frame).resize(
+                (frame.shape[1] * 32, frame.shape[0] * 32),
+                resample=Image.NEAREST,
+            )
+        )
+
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_views = obs["local_views"][None, ...]
+        proprioceptions = obs["proprioceptions"][None, ...]
+
+        seer_carry, messages, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+        )
+
+        batch_size, num_doers = local_views.shape[:2]
+        flat_local_views = local_views.reshape((batch_size * num_doers,) + local_views.shape[2:])
+        flat_proprioceptions = proprioceptions.reshape(
+            (batch_size * num_doers,) + proprioceptions.shape[2:]
+        )
+        flat_messages = messages.reshape((batch_size * num_doers,) + messages.shape[2:])
+        flat_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size * num_doers,) + x.shape[2:]),
+            doer_carry,
+        )
+        next_flat_doer_carry, flat_logits = doer.apply(
+            {"params": params["doer"]},
+            flat_doer_carry,
+            flat_local_views,
+            flat_proprioceptions,
+            flat_messages,
+        )
+        doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
+            next_flat_doer_carry,
+        )
+        actions = jnp.argmax(
+            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))[0],
+            axis=-1,
+        ).astype(jnp.int32)
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(step_rng, state, actions)
+        success = success or bool(info["success"])
+        step_count += 1
+
+    if frames:
+        frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=150,
+            loop=0,
+        )
+        wandb.log(
+            {
+                "two_doer_eval_episode": wandb.Video(str(output_path), format="gif"),
+                "two_doer_eval_episode_solved": int(success),
+            },
+            commit=False,
+        )
+        print(f"Two-doer eval episode saved to {output_path}")
+
+    return rng, output_path, success
+
+
 def run_two_doer_training(config):
     rng = jax.random.PRNGKey(config["seed"])
     rng, seer_init_rng, doer_init_rng, critic_init_rng, reset_rng = jax.random.split(rng, 5)
@@ -608,6 +706,17 @@ def run_two_doer_training(config):
             wandb.log({"greedy_episode_solved": int(greedy_solved)})
             print(f"Greedy eval @ {update}: solved={int(greedy_solved)}")
 
+        if update > 0 and update % config["visualize_every"] == 0:
+            rng, _, _ = visualize_two_doer_episode(
+                env,
+                params,
+                rng,
+                seer,
+                doer,
+                config,
+                update,
+            )
+
 
 def main():
     # 1. Configuration and Logging
@@ -633,6 +742,7 @@ def main():
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
         "eval_every": 25,
+        "visualize_every": 50,
         "use_seer_nav_phase": False,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
