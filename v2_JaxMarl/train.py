@@ -340,11 +340,12 @@ def main():
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
+        "use_seer_nav_phase": True,
         "seer_required_start_positions": 5,
         "communication_start_positions_per_level": 5,
         "release_goal_after_max_level": True,
         "min_start_distance": 1.0,
-        "step_penalty": 0.01,
+        "step_penalty": 0.03,
         "bump_penalty": 0.1,
         "visualize_max_steps": 30,
         "visualize_dir": "artifacts/episodes",
@@ -372,7 +373,11 @@ def main():
     )
     seer_nav_mode = jnp.array(env.SEER_NAV_PHASE, dtype=jnp.int32)
     communication_mode = jnp.array(env.COMMUNICATION_PHASE, dtype=jnp.int32)
-    control_mode = seer_nav_mode
+    control_mode = (
+        seer_nav_mode
+        if config["use_seer_nav_phase"]
+        else communication_mode
+    )
 
     # 4. Initial Environment Reset
     fixed_goal_position = UNSET_POSITION
@@ -459,7 +464,8 @@ def main():
     
     print(
         "Starting training... "
-        f"(doer_perception_level={config['doer_perception_level']})"
+        f"(phase={'seer_nav' if config['use_seer_nav_phase'] else 'communication'}, "
+        f"doer_perception_level={config['doer_perception_level']})"
     )
     for update in range(num_updates):
         rng, rollout_rng = jax.random.split(rng)
