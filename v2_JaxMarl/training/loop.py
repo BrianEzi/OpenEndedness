@@ -305,7 +305,7 @@ def make_two_doer_rollout_step(
     """Rollout step for one Seer coordinating two embodied Doers."""
 
     def rollout_step(runner_state: Tuple, _):
-        params, seer_carry, doer_carry, env_state, env_obs, rng = runner_state
+        params, seer_carry, doer_carry, env_state, env_obs, rng, fixed_positions = runner_state
         num_envs = env_obs["global_map"].shape[0]
         global_map = env_obs["global_map"]
         symbolic_obs = env_obs["symbolic_state"]
@@ -355,6 +355,7 @@ def make_two_doer_rollout_step(
             env_step_keys,
             env_state,
             doer_action,
+            fixed_positions=fixed_positions,
         )
 
         next_seer_carry = jax.tree_util.tree_map(
@@ -393,6 +394,7 @@ def make_two_doer_rollout_step(
             next_env_state,
             next_env_obs,
             rng,
+            fixed_positions,
         )
         return next_runner_state, transition
 
@@ -410,6 +412,7 @@ def generate_two_doer_trajectory_and_gae(
     env_state,
     seer_carry,
     doer_carry,
+    fixed_positions,
     num_steps: int,
     step_fn,
     critic_apply_fn,
@@ -421,6 +424,7 @@ def generate_two_doer_trajectory_and_gae(
         env_state,
         env_obs,
         rng,
+        fixed_positions,
     )
     final_runner_state, trajectory_batch = jax.lax.scan(
         step_fn,
@@ -428,7 +432,7 @@ def generate_two_doer_trajectory_and_gae(
         None,
         length=num_steps,
     )
-    _, _, _, _, final_env_obs, _ = final_runner_state
+    _, _, _, _, final_env_obs, _, _ = final_runner_state
     last_val = critic_apply_fn(
         {"params": params["critic"]},
         final_env_obs["global_map"],

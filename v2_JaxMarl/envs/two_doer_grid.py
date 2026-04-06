@@ -3,6 +3,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+UNSET_TWO_DOER_POSITIONS = jnp.full((2, 2), -1, dtype=jnp.int32)
+
 
 @struct.dataclass
 class TwoDoerState:
@@ -139,24 +141,36 @@ class TwoDoerBottleneckEnv:
             "proprioceptions": proprioceptions,
         }
 
-    def reset(self, key: jnp.ndarray):
+    def _goals_from_positions(self, positions: jnp.ndarray) -> jnp.ndarray:
+        return jnp.asarray(
+            [
+                [positions[0, 0], self._right_col],
+                [positions[1, 0], self._left_col],
+            ],
+            dtype=jnp.int32,
+        )
+
+    def reset(
+        self,
+        key: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
         row_key_a, row_key_b = jax.random.split(key)
         row_a = self._candidate_rows[jax.random.randint(row_key_a, (), 0, self._candidate_rows.shape[0])]
         row_b = self._candidate_rows[jax.random.randint(row_key_b, (), 0, self._candidate_rows.shape[0])]
-        positions = jnp.asarray(
+        sampled_positions = jnp.asarray(
             [
                 [row_a, self._left_col],
                 [row_b, self._right_col],
             ],
             dtype=jnp.int32,
         )
-        goals = jnp.asarray(
-            [
-                [row_a, self._right_col],
-                [row_b, self._left_col],
-            ],
-            dtype=jnp.int32,
+        positions = jnp.where(
+            jnp.all(fixed_positions >= 0),
+            fixed_positions.astype(jnp.int32),
+            sampled_positions,
         )
+        goals = self._goals_from_positions(positions)
         state = TwoDoerState(
             positions=positions,
             goals=goals,
@@ -165,8 +179,12 @@ class TwoDoerBottleneckEnv:
         )
         return self._split_observations(state), state
 
-    def reset_batch(self, keys: jnp.ndarray):
-        return jax.vmap(self.reset)(keys)
+    def reset_batch(
+        self,
+        keys: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        return jax.vmap(self.reset, in_axes=(0, None))(keys, fixed_positions)
 
     def _resolve_actions(self, positions: jnp.ndarray, actions: jnp.ndarray):
         deltas = jnp.asarray(
@@ -209,9 +227,15 @@ class TwoDoerBottleneckEnv:
         final_positions = jnp.where(collision_blocks[:, None], positions, proposed)
         return final_positions, wall_hits, collision_blocks
 
-    def step(self, key: jnp.ndarray, state: TwoDoerState, actions: jnp.ndarray):
+    def step(
+        self,
+        key: jnp.ndarray,
+        state: TwoDoerState,
+        actions: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
         def reset_branch(_):
-            reset_obs, reset_state = self.reset(key)
+            reset_obs, reset_state = self.reset(key, fixed_positions=fixed_positions)
             zeros = jnp.asarray(0.0, dtype=jnp.float32)
             info = {
                 "task_reward": zeros,
@@ -262,8 +286,14 @@ class TwoDoerBottleneckEnv:
 
         return jax.lax.cond(state.done, reset_branch, step_branch, operand=None)
 
-    def step_batch(self, keys: jnp.ndarray, states: TwoDoerState, actions: jnp.ndarray):
-        return jax.vmap(self.step)(keys, states, actions)
+    def step_batch(
+        self,
+        keys: jnp.ndarray,
+        states: TwoDoerState,
+        actions: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, actions, fixed_positions)
 
     def render(self, state: TwoDoerState) -> np.ndarray:
         frame = np.ones((self.grid_size, self.grid_size, 3), dtype=np.float32) * 0.96
