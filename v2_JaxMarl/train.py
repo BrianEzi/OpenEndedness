@@ -994,7 +994,7 @@ def main():
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
         "eval_every": 25,
-        "visualize_every": 50,
+        "visualize_every": 200,
         "use_two_doer_start_curriculum": True,
         "two_doer_required_start_positions": 5,
         "use_seer_nav_phase": False,
