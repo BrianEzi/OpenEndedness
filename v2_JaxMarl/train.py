@@ -914,6 +914,8 @@ def run_two_doer_training(config):
                     {f"greedy_episode_solved_{eval_idx + 1}": int(greedy_solved)},
                     commit=False,
                 )
+                if not greedy_solved:
+                    break
             current_start_success_streak = eval_successes
             greedy_solved = eval_successes == config["curriculum_eval_episodes"]
             wandb.log(
