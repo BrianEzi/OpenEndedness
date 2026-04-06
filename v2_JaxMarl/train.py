@@ -569,6 +569,19 @@ def save_two_doer_initial_visualization(env, state, config):
     return output_path
 
 
+def print_two_doer_start_positions_banner(fixed_positions, label="TWO-DOER STARTS"):
+    positions_np = np.asarray(fixed_positions).tolist()
+    print("")
+    print("=" * 72)
+    print(label)
+    print(
+        f"Doer A: ({positions_np[0][0]}, {positions_np[0][1]}) | "
+        f"Doer B: ({positions_np[1][0]}, {positions_np[1][1]})"
+    )
+    print("=" * 72)
+    print("")
+
+
 def visualize_two_doer_episode(
     env,
     params,
@@ -693,6 +706,7 @@ def run_two_doer_training(config):
     fixed_positions = UNSET_TWO_DOER_POSITIONS
     if curriculum_active:
         rng, fixed_positions = sample_two_doer_curriculum_anchor(env, rng)
+        print_two_doer_start_positions_banner(fixed_positions, label="INITIAL TWO-DOER STARTS")
 
     rng, env_obs, env_state = reset_two_doer_batch(
         env,
@@ -920,15 +934,10 @@ def run_two_doer_training(config):
                             rng,
                             exclude_positions=previous_fixed_positions,
                         )
-                        print("")
-                        print("=" * 72)
-                        print(
-                            "NEW TWO-DOER STARTS: "
-                            f"{tuple(np.asarray(fixed_positions[0]).tolist())}, "
-                            f"{tuple(np.asarray(fixed_positions[1]).tolist())}"
+                        print_two_doer_start_positions_banner(
+                            fixed_positions,
+                            label="NEW TWO-DOER STARTS",
                         )
-                        print("=" * 72)
-                        print("")
 
                     rng, env_obs, env_state = reset_two_doer_batch(
                         env,
