@@ -19,8 +19,10 @@ class TwoDoerBottleneckEnv:
 
     def __init__(
         self,
-        grid_size: int = 9,
+        grid_height: int = 10,
+        grid_width: int = 12,
         local_view_size: int = 3,
+        corridor_length: int = 3,
         max_steps: int = 48,
         progress_reward_scale: float = 0.05,
         goal_reward: float = 1.0,
@@ -28,13 +30,21 @@ class TwoDoerBottleneckEnv:
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
     ):
-        if grid_size < 7 or grid_size % 2 == 0:
-            raise ValueError("grid_size must be an odd integer >= 7.")
+        if grid_height < 8:
+            raise ValueError("grid_height must be >= 8.")
+        if grid_width < 10:
+            raise ValueError("grid_width must be >= 10.")
         if local_view_size % 2 == 0:
             raise ValueError("local_view_size must be odd.")
+        if corridor_length < 1:
+            raise ValueError("corridor_length must be >= 1.")
+        if grid_width - corridor_length - 2 < 4:
+            raise ValueError("grid_width is too small for the requested corridor_length.")
 
-        self.grid_size = int(grid_size)
+        self.grid_height = int(grid_height)
+        self.grid_width = int(grid_width)
         self.local_view_size = int(local_view_size)
+        self.corridor_length = int(corridor_length)
         self.max_steps = int(max_steps)
         self.progress_reward_scale = jnp.asarray(progress_reward_scale, dtype=jnp.float32)
         self.goal_reward = jnp.asarray(goal_reward, dtype=jnp.float32)
@@ -43,11 +53,12 @@ class TwoDoerBottleneckEnv:
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
         self.num_doers = 2
         self._view_radius = self.local_view_size // 2
-        self._bottleneck_row = self.grid_size // 2
-        self._bottleneck_col = self.grid_size // 2
+        self._corridor_row = self.grid_height // 2
+        self._corridor_start_col = (self.grid_width - self.corridor_length) // 2
+        self._corridor_end_col = self._corridor_start_col + self.corridor_length
         self._left_col = 1
-        self._right_col = self.grid_size - 2
-        self._candidate_rows = jnp.asarray([1, 2, self.grid_size - 3, self.grid_size - 2], dtype=jnp.int32)
+        self._right_col = self.grid_width - 2
+        self._candidate_rows = jnp.asarray([1, 2, self.grid_height - 3, self.grid_height - 2], dtype=jnp.int32)
         self._wall_map = self._build_wall_map()
         self._goal_colors = jnp.asarray(
             [
@@ -70,13 +81,14 @@ class TwoDoerBottleneckEnv:
         return 5
 
     def _build_wall_map(self) -> jnp.ndarray:
-        wall_map = jnp.zeros((self.grid_size, self.grid_size), dtype=bool)
+        wall_map = jnp.zeros((self.grid_height, self.grid_width), dtype=bool)
         wall_map = wall_map.at[0, :].set(True)
         wall_map = wall_map.at[-1, :].set(True)
         wall_map = wall_map.at[:, 0].set(True)
         wall_map = wall_map.at[:, -1].set(True)
-        wall_map = wall_map.at[:, self._bottleneck_col].set(True)
-        wall_map = wall_map.at[self._bottleneck_row, self._bottleneck_col].set(False)
+        corridor_cols = jnp.arange(self._corridor_start_col, self._corridor_end_col)
+        wall_map = wall_map.at[:, corridor_cols].set(True)
+        wall_map = wall_map.at[self._corridor_row, corridor_cols].set(False)
         return wall_map
 
     @staticmethod
@@ -84,7 +96,7 @@ class TwoDoerBottleneckEnv:
         return jnp.abs(positions - goals).sum(axis=-1).astype(jnp.float32)
 
     def _compose_global_map(self, state: TwoDoerState) -> jnp.ndarray:
-        global_map = jnp.zeros((self.grid_size, self.grid_size, 5), dtype=jnp.float32)
+        global_map = jnp.zeros((self.grid_height, self.grid_width, 5), dtype=jnp.float32)
         global_map = global_map.at[:, :, 0].set(self._wall_map.astype(jnp.float32))
         global_map = global_map.at[state.positions[0, 0], state.positions[0, 1], 1].set(1.0)
         global_map = global_map.at[state.positions[1, 0], state.positions[1, 1], 2].set(1.0)
@@ -124,8 +136,24 @@ class TwoDoerBottleneckEnv:
         )
         symbolic_state = jnp.concatenate(
             [
-                state.positions.astype(jnp.float32).reshape(-1) / float(self.grid_size - 1),
-                state.goals.astype(jnp.float32).reshape(-1) / float(self.grid_size - 1),
+                jnp.asarray(
+                    [
+                        state.positions[0, 0] / float(self.grid_height - 1),
+                        state.positions[0, 1] / float(self.grid_width - 1),
+                        state.positions[1, 0] / float(self.grid_height - 1),
+                        state.positions[1, 1] / float(self.grid_width - 1),
+                    ],
+                    dtype=jnp.float32,
+                ),
+                jnp.asarray(
+                    [
+                        state.goals[0, 0] / float(self.grid_height - 1),
+                        state.goals[0, 1] / float(self.grid_width - 1),
+                        state.goals[1, 0] / float(self.grid_height - 1),
+                        state.goals[1, 1] / float(self.grid_width - 1),
+                    ],
+                    dtype=jnp.float32,
+                ),
                 goals_reached,
                 jnp.asarray(
                     [state.step_count.astype(jnp.float32) / float(self.max_steps)],
@@ -296,7 +324,7 @@ class TwoDoerBottleneckEnv:
         return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, actions, fixed_positions)
 
     def render(self, state: TwoDoerState) -> np.ndarray:
-        frame = np.ones((self.grid_size, self.grid_size, 3), dtype=np.float32) * 0.96
+        frame = np.ones((self.grid_height, self.grid_width, 3), dtype=np.float32) * 0.96
         frame[np.asarray(self._wall_map)] = np.array([0.18, 0.18, 0.22], dtype=np.float32)
 
         for agent_idx in range(self.num_doers):
@@ -307,5 +335,8 @@ class TwoDoerBottleneckEnv:
             row, col = np.asarray(state.positions[agent_idx]).tolist()
             frame[row, col] = np.asarray(self._agent_colors[agent_idx])
 
-        frame[self._bottleneck_row, self._bottleneck_col] = np.array([0.98, 0.88, 0.45], dtype=np.float32)
+        frame[
+            self._corridor_row,
+            self._corridor_start_col:self._corridor_end_col,
+        ] = np.array([0.98, 0.88, 0.45], dtype=np.float32)
         return (frame * 255.0).astype(np.uint8)

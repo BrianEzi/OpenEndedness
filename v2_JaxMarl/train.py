@@ -691,8 +691,10 @@ def run_two_doer_training(config):
     rng, seer_init_rng, doer_init_rng, critic_init_rng, reset_rng = jax.random.split(rng, 5)
 
     env = TwoDoerBottleneckEnv(
-        grid_size=config["grid_size"],
+        grid_height=config["grid_height"],
+        grid_width=config["grid_width"],
         local_view_size=config["local_view_size"],
+        corridor_length=config["corridor_length"],
         max_steps=config["episode_max_steps"],
         progress_reward_scale=config["progress_reward_scale"],
         goal_reward=config["goal_reward"],
@@ -977,8 +979,10 @@ def main():
         "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [4, 4],
         "seed": 42,
-        "grid_size": 9,
+        "grid_height": 10,
+        "grid_width": 12,
         "local_view_size": 3,
+        "corridor_length": 3,
         "episode_max_steps": 48,
         "goal_reward": 1.0,
         "follow_reward_scale": 0.1,
