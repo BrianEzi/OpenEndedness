@@ -1012,7 +1012,7 @@ def main():
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
-        "eval_every": 25,
+        "eval_every": 200,
         "visualize_every": 200,
         "use_two_doer_start_curriculum": True,
         "two_doer_required_start_positions": 5,
