@@ -17,6 +17,7 @@ class TwoDoerState:
     selected_correctly: jnp.ndarray
     has_selected: jnp.ndarray
     has_arrived: jnp.ndarray
+    selection_attempts: jnp.ndarray
     selected_option_idx: jnp.ndarray
 
 
@@ -34,10 +35,12 @@ class TwoDoerBottleneckEnv:
         goal_reward: float = 1.0,
         arrival_reward: float = 0.5,
         individual_selection_reward: float = 0.5,
+        wrong_selection_penalty: float = 0.15,
         step_penalty: float = 0.03,
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
         doer_perception_level: int = 2,
+        selection_phase_level: int = 1,
         render_tile_size: int = 24,
     ):
         if grid_height < 8:
@@ -60,10 +63,13 @@ class TwoDoerBottleneckEnv:
         self.goal_reward = jnp.asarray(goal_reward, dtype=jnp.float32)
         self.arrival_reward = jnp.asarray(arrival_reward, dtype=jnp.float32)
         self.individual_selection_reward = jnp.asarray(individual_selection_reward, dtype=jnp.float32)
+        self.wrong_selection_penalty = jnp.asarray(wrong_selection_penalty, dtype=jnp.float32)
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
         self.doer_perception_level = int(doer_perception_level)
+        self.selection_phase_level = 1
+        self.set_selection_phase_level(selection_phase_level)
         self.render_tile_size = int(render_tile_size)
         self.num_doers = 2
         self._view_radius = self.local_view_size // 2
@@ -98,6 +104,16 @@ class TwoDoerBottleneckEnv:
             dtype=jnp.float32,
         )
         self.item_bank = self._build_item_bank()
+
+    @property
+    def max_selection_attempts(self) -> int:
+        return 2 if self.selection_phase_level == 1 else 1
+
+    def set_selection_phase_level(self, level: int) -> None:
+        level = int(level)
+        if level not in (1, 2):
+            raise ValueError(f"Unsupported selection_phase_level={level}. Use 1 or 2.")
+        self.selection_phase_level = level
 
     @property
     def num_actions(self) -> int:
@@ -309,6 +325,7 @@ class TwoDoerBottleneckEnv:
             selected_correctly=jnp.array([False, False]),
             has_selected=jnp.array([False, False]),
             has_arrived=jnp.array([False, False]),
+            selection_attempts=jnp.zeros((self.num_doers,), dtype=jnp.int32),
             selected_option_idx=jnp.array([-1, -1]),
         )
         return self._split_observations(state), state
@@ -374,6 +391,7 @@ class TwoDoerBottleneckEnv:
             info = {
                 "task_reward": zeros,
                 "individual_selection_reward": zeros,
+                "wrong_selection_penalty": zeros,
                 "progress_reward_per_doer": jnp.zeros((self.num_doers,), dtype=jnp.float32),
                 "step_penalty": zeros,
                 "wall_penalty": zeros,
@@ -385,6 +403,7 @@ class TwoDoerBottleneckEnv:
             return reset_obs, reset_state, zeros, jnp.asarray(False), info
 
         def step_branch(_):
+            max_selection_attempts = self.max_selection_attempts
             nav_actions = jnp.where(actions < 5, actions, 0)
             select_actions = actions - 5
             is_selecting = actions >= 5
@@ -396,8 +415,15 @@ class TwoDoerBottleneckEnv:
             chosen_item = jnp.take_along_axis(state.shuffled_menus, select_actions[:, None], axis=1)[:, 0]
             is_correct = chosen_item == state.target_items
             
-            new_has_selected = jnp.logical_or(state.has_selected, valid_selection)
-            new_selected_correctly = jnp.logical_or(state.selected_correctly, jnp.logical_and(valid_selection, is_correct))
+            new_selection_attempts = state.selection_attempts + valid_selection.astype(jnp.int32)
+            correct_selection = jnp.logical_and(valid_selection, is_correct)
+            wrong_selection = jnp.logical_and(valid_selection, ~is_correct)
+            new_selected_correctly = jnp.logical_or(state.selected_correctly, correct_selection)
+            attempts_exhausted = new_selection_attempts >= max_selection_attempts
+            new_has_selected = jnp.logical_or(
+                state.has_selected,
+                jnp.logical_or(new_selected_correctly, attempts_exhausted),
+            )
             
             old_distances = self._manhattan_distance(state.positions, state.goals)
             next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
@@ -429,7 +455,12 @@ class TwoDoerBottleneckEnv:
                 state.selected_option_idx
             )
 
-            individual_selection_reward = (jnp.logical_and(valid_selection, is_correct).astype(jnp.float32) * self.individual_selection_reward).sum()
+            individual_selection_reward = (
+                correct_selection.astype(jnp.float32) * self.individual_selection_reward
+            ).sum()
+            wrong_selection_penalty = (
+                wrong_selection.astype(jnp.float32) * self.wrong_selection_penalty
+            ).sum()
 
             any_failure = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
             all_success = jnp.all(new_selected_correctly)
@@ -446,6 +477,7 @@ class TwoDoerBottleneckEnv:
                 + progress_reward
                 + arrival_reward
                 - self.step_penalty
+                - wrong_selection_penalty
                 - wall_penalty
                 - collision_penalty
             )
@@ -459,11 +491,13 @@ class TwoDoerBottleneckEnv:
                 selected_correctly=new_selected_correctly,
                 has_selected=new_has_selected,
                 has_arrived=new_has_arrived,
+                selection_attempts=new_selection_attempts,
                 selected_option_idx=new_selected_option_idx,
             )
             info = {
                 "task_reward": team_completion_reward,
                 "individual_selection_reward": individual_selection_reward,
+                "wrong_selection_penalty": wrong_selection_penalty,
                 "progress_reward_per_doer": progress_reward_per_doer,
                 "step_penalty": self.step_penalty,
                 "wall_penalty": wall_penalty,
@@ -542,7 +576,7 @@ class TwoDoerBottleneckEnv:
             
             # Render menu options throughout the entire episode
             menus = np.asarray(state.shuffled_menus[agent_idx])
-            has_sel = bool(np.asarray(state.has_selected[agent_idx]))
+            has_sel = bool(np.asarray(state.selection_attempts[agent_idx] > 0))
             sel_idx = int(np.asarray(state.selected_option_idx[agent_idx]))
             
             for m_idx, option_id in enumerate(menus):

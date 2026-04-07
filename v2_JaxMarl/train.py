@@ -615,6 +615,34 @@ def print_two_doer_perception_level_banner(level, label="TWO-DOER PERCEPTION LEV
     print("")
 
 
+def print_two_doer_selection_level_banner(level, env, label="TWO-DOER SELECTION LEVEL"):
+    if int(level) == 1:
+        description = (
+            "LEVEL 1: each doer gets up to 2 selections; "
+            f"wrong picks cost {float(env.wrong_selection_penalty):.2f}"
+        )
+    else:
+        description = "LEVEL 2: each doer gets exactly 1 selection"
+    print("")
+    print("=" * 72)
+    print(label)
+    print(f"LEVEL {int(level)} | max_selection_attempts={env.max_selection_attempts}")
+    print(description)
+    print("=" * 72)
+    print("")
+
+
+def log_two_doer_selection_level(config, level, update, event):
+    maybe_wandb_log(
+        config,
+        {
+            "two_doer_selection_level": int(level),
+            "two_doer_selection_level_event": str(event),
+            "two_doer_selection_level_step": int(update),
+        },
+    )
+
+
 def visualize_two_doer_episode(
     env,
     params,
@@ -734,10 +762,12 @@ def run_two_doer_training(config):
         max_steps=config["episode_max_steps"],
         progress_reward_scale=config["progress_reward_scale"],
         goal_reward=config["goal_reward"],
+        wrong_selection_penalty=config["wrong_selection_penalty"],
         step_penalty=config["step_penalty"],
         wall_penalty=config["wall_penalty"],
         collision_penalty=config["collision_penalty"],
         doer_perception_level=config["doer_perception_level"],
+        selection_phase_level=config["two_doer_selection_level_start"],
     )
     curriculum_active = (
         config["use_two_doer_start_curriculum"]
@@ -752,6 +782,17 @@ def run_two_doer_training(config):
     print_two_doer_perception_level_banner(
         env.doer_perception_level,
         label="INITIAL TWO-DOER PERCEPTION LEVEL",
+    )
+    print_two_doer_selection_level_banner(
+        env.selection_phase_level,
+        env,
+        label="INITIAL TWO-DOER SELECTION LEVEL",
+    )
+    log_two_doer_selection_level(
+        config,
+        env.selection_phase_level,
+        0,
+        "initial",
     )
 
     rng, env_obs, env_state = reset_two_doer_batch(
@@ -895,6 +936,7 @@ def run_two_doer_training(config):
                     {
                         "task_variant": config["task_variant"],
                         "doer_perception_level": env.doer_perception_level,
+                        "two_doer_selection_level": env.selection_phase_level,
                         "curriculum_fixed_starts": int(curriculum_active),
                         "curriculum_eval_gate_passed": int(
                             rollout_success_rate >= config["curriculum_rollout_success_threshold"]
@@ -921,6 +963,7 @@ def run_two_doer_training(config):
                 )
             print(
                 f"Update {update}/{num_updates} | "
+                f"Level: {env.selection_phase_level} | "
                 f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
                 f"EvalGate: {int(rollout_success_rate >= config['curriculum_rollout_success_threshold'])} | "
                 f"Mastered: {mastered_start_positions}/"
@@ -939,6 +982,42 @@ def run_two_doer_training(config):
                 f"CIC: {float(cic_score):.3f} | "
                 f"SeerGrad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
                 f"DoerGrad: {actor_metrics.get('doer_grad_norm', 0.0):.4f}"
+            )
+
+        if (
+            env.selection_phase_level == 1
+            and float(rollout_success_rate) > config["two_doer_selection_level_advance_threshold"]
+        ):
+            env.set_selection_phase_level(2)
+            step_fn = make_two_doer_rollout_step(
+                env,
+                seer.apply,
+                doer.apply,
+                critic.apply,
+            )
+            print_two_doer_selection_level_banner(
+                env.selection_phase_level,
+                env,
+                label="ADVANCED TWO-DOER SELECTION LEVEL",
+            )
+            log_two_doer_selection_level(
+                config,
+                env.selection_phase_level,
+                update,
+                "advanced",
+            )
+            rng, env_obs, env_state = reset_two_doer_batch(
+                env,
+                rng,
+                config["num_envs"],
+                fixed_positions,
+            )
+            seer_carry = seer.initialize_carry(config["num_envs"], 128)
+            doer_carry = initialize_two_doer_carry(
+                doer,
+                num_envs=config["num_envs"],
+                num_doers=env.num_doers,
+                hidden_size=128,
             )
 
         if update > 0 and update % config["eval_every"] == 0:
@@ -1057,9 +1136,12 @@ def main():
         "goal_reward": 1.0,
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.1,
+        "wrong_selection_penalty": 0.15,
         "cic_coef": 0.01,
         "seer_entropy_coef": 0.05,
         "doer_perception_level": 2,
+        "two_doer_selection_level_start": 1,
+        "two_doer_selection_level_advance_threshold": 0.90,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,
