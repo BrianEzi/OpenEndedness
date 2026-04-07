@@ -1246,6 +1246,24 @@ def run_two_doer_training(config):
                 )
                 return
 
+    final_global_step = int(num_updates * config["num_steps"] * config["num_envs"])
+    print("")
+    print("=" * 72)
+    print(
+        "TWO-DOER TRAINING COMPLETE: saving final checkpoint and codebook "
+        f"at global_step={final_global_step}"
+    )
+    print("=" * 72)
+    print("")
+    probe_and_save_codebook(
+        env,
+        params,
+        rng,
+        doer,
+        config["fsq_levels"],
+        checkpoint_step=final_global_step,
+    )
+
 
 def main():
     # 1. Configuration and Logging
@@ -1270,7 +1288,7 @@ def main():
         "cic_coef": 0.01,
         "seer_entropy_coef": 0.05,
         "doer_perception_level": 2,
-        "two_doer_selection_level_start": 1,
+        "two_doer_selection_level_start": 2,
         "two_doer_selection_level_advance_threshold": 0.90,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
