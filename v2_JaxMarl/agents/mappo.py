@@ -7,6 +7,7 @@ import chex
 from typing import Tuple, Any, Callable
 import distrax 
 import optax
+from training.action_masking import mask_pick_actions_until_menu_visible
 
 # 1. Data Structures: Meticulous shape tracking
 # Using chex helps enforce accuracy by allowing us to assert shapes later.
@@ -52,6 +53,8 @@ class TwoDoerTransition:
     reward: chex.Array
     task_reward: chex.Array
     individual_selection_reward: chex.Array
+    valid_selection_count: chex.Array
+    correct_selection_count: chex.Array
     progress_reward_per_doer: chex.Array
     step_penalty_component: chex.Array
     wall_penalty_component: chex.Array
@@ -285,6 +288,10 @@ def calculate_two_doer_actor_losses(
             next_flat_doer_carry,
         )
         doer_logits = flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))
+        doer_logits = mask_pick_actions_until_menu_visible(
+            doer_logits,
+            transition_step.menu_images,
+        )
         return (next_seer_carry, next_doer_carry), (doer_logits, discrete_messages)
 
     _, (doer_logits, discrete_messages) = jax.lax.scan(

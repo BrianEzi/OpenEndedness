@@ -16,6 +16,7 @@ from training.loop import (
     make_rollout_step,
     make_two_doer_rollout_step,
 )
+from training.action_masking import mask_pick_actions_until_menu_visible
 from agents.mappo import (
     update_actor,
     update_actor_two_doer,
@@ -495,8 +496,12 @@ def _run_two_doer_greedy_episode(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
             next_flat_doer_carry,
         )
+        masked_logits = mask_pick_actions_until_menu_visible(
+            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
+            menu_images,
+        )
         actions = jnp.argmax(
-            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))[0],
+            masked_logits[0],
             axis=-1,
         ).astype(jnp.int32)
 
@@ -801,8 +806,12 @@ def visualize_two_doer_episode(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
             next_flat_doer_carry,
         )
+        masked_logits = mask_pick_actions_until_menu_visible(
+            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
+            menu_images,
+        )
         actions = jnp.argmax(
-            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))[0],
+            masked_logits[0],
             axis=-1,
         ).astype(jnp.int32)
         trace_line, left_text, right_text = build_two_doer_trace_snapshot(
@@ -1023,6 +1032,13 @@ def run_two_doer_training(config):
             / completed_episodes.astype(jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
         )
+        total_valid_selections = trajectory_batch.valid_selection_count.sum()
+        total_correct_selections = trajectory_batch.correct_selection_count.sum()
+        selection_accuracy = jnp.where(
+            total_valid_selections > 0.0,
+            total_correct_selections / total_valid_selections,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
         message_stats = compute_message_stats(trajectory_batch.message, config["fsq_levels"])
         rng, cic_rng = jax.random.split(rng)
         cic_score = compute_two_doer_cic(
@@ -1050,6 +1066,9 @@ def run_two_doer_training(config):
                         "team_reward": trajectory_batch.reward.mean(),
                         "task_reward": trajectory_batch.task_reward.mean(),
                         "individual_selection_reward": trajectory_batch.individual_selection_reward.mean(),
+                        "selection_accuracy": selection_accuracy,
+                        "valid_selection_count": total_valid_selections,
+                        "correct_selection_count": total_correct_selections,
                         "progress_reward_doer_a": trajectory_batch.progress_reward_per_doer[..., 0].mean(),
                         "progress_reward_doer_b": trajectory_batch.progress_reward_per_doer[..., 1].mean(),
                         "step_penalty": trajectory_batch.step_penalty_component.mean(),
@@ -1074,6 +1093,8 @@ def run_two_doer_training(config):
                 f"Mastered: {mastered_start_positions}/"
                 f"{config['two_doer_required_start_positions']} | "
                 f"SuccessRate: {float(rollout_success_rate):.3f} | "
+                f"SelAcc: {float(selection_accuracy):.3f} | "
+                f"Sel: {float(total_correct_selections):.0f}/{float(total_valid_selections):.0f} | "
                 f"TeamReward: {trajectory_batch.reward.mean():.3f} | "
                 f"Task: {trajectory_batch.task_reward.mean():.3f} | "
                 f"IndSel: {trajectory_batch.individual_selection_reward.mean():.3f} | "

@@ -392,6 +392,8 @@ class TwoDoerBottleneckEnv:
                 "task_reward": zeros,
                 "individual_selection_reward": zeros,
                 "wrong_selection_penalty": zeros,
+                "valid_selection_count": zeros,
+                "correct_selection_count": zeros,
                 "progress_reward_per_doer": jnp.zeros((self.num_doers,), dtype=jnp.float32),
                 "step_penalty": zeros,
                 "wall_penalty": zeros,
@@ -461,6 +463,8 @@ class TwoDoerBottleneckEnv:
             wrong_selection_penalty = (
                 wrong_selection.astype(jnp.float32) * self.wrong_selection_penalty
             ).sum()
+            valid_selection_count = valid_selection.astype(jnp.float32).sum()
+            correct_selection_count = correct_selection.astype(jnp.float32).sum()
 
             any_failure = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
             all_success = jnp.all(new_selected_correctly)
@@ -498,6 +502,8 @@ class TwoDoerBottleneckEnv:
                 "task_reward": team_completion_reward,
                 "individual_selection_reward": individual_selection_reward,
                 "wrong_selection_penalty": wrong_selection_penalty,
+                "valid_selection_count": valid_selection_count,
+                "correct_selection_count": correct_selection_count,
                 "progress_reward_per_doer": progress_reward_per_doer,
                 "step_penalty": self.step_penalty,
                 "wall_penalty": wall_penalty,
