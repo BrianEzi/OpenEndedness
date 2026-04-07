@@ -49,6 +49,19 @@ def parse_args():
         default=4,
         help="How many distractor menu variants to test per target object.",
     )
+    parser.add_argument(
+        "--sequence-length",
+        type=int,
+        default=1,
+        choices=(1, 2, 3),
+        help="How many consecutive messages to feed through the doer's LSTM before reading out behavior.",
+    )
+    parser.add_argument(
+        "--print-summary-limit",
+        type=int,
+        default=64,
+        help="Maximum number of summary lines to print to stdout. Full results always go to JSON.",
+    )
     return parser.parse_args()
 
 
@@ -96,6 +109,15 @@ def all_messages(fsq_levels):
     return [tuple(word) for word in itertools.product(*[range(level) for level in fsq_levels])]
 
 
+def all_message_sequences(fsq_levels, sequence_length: int):
+    messages = all_messages(fsq_levels)
+    return [tuple(seq) for seq in itertools.product(messages, repeat=sequence_length)]
+
+
+def message_sequence_key(message_sequence) -> str:
+    return " -> ".join(str(word) for word in message_sequence)
+
+
 def build_eval_contexts():
     nav_env = TwoDoerBottleneckEnv(selection_phase_level=2)
     fixed_positions = jnp.asarray(
@@ -135,50 +157,89 @@ def distractor_packs_for_target(target_id: int, num_items: int, num_packs: int):
     return packs
 
 
-def run_doer(doer, doer_params, carry, local_obs, proprioception, message, menu_images, pick_only_phase):
-    _, logits = doer.apply(
-        {"params": doer_params},
-        carry,
-        local_obs,
-        proprioception,
-        message,
-        menu_images,
-    )
-    masked_logits = mask_pick_actions_until_menu_visible(
-        logits,
-        menu_images,
-        pick_only_phase=pick_only_phase,
-    )
-    action = int(jnp.argmax(masked_logits[0]))
-    return action
+def action_label(action: int) -> str:
+    if action < 5:
+        return NAV_ACTION_LABELS[action]
+    return f"pick_{action - 5}"
 
 
-def probe_navigation_semantics(doer, doer_params, nav_obs, fsq_levels):
+def run_doer_sequence(
+    doer,
+    doer_params,
+    local_obs,
+    proprioception,
+    message_sequence,
+    menu_images,
+    pick_only_phase,
+):
     carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    action_trace = []
+    logits_trace = []
+
+    for word in message_sequence:
+        message = jnp.asarray([word], dtype=jnp.float32)
+        carry, logits = doer.apply(
+            {"params": doer_params},
+            carry,
+            local_obs,
+            proprioception,
+            message,
+            menu_images,
+        )
+        masked_logits = mask_pick_actions_until_menu_visible(
+            logits,
+            menu_images,
+            pick_only_phase=pick_only_phase,
+        )
+        action = int(jnp.argmax(masked_logits[0]))
+        action_trace.append(action)
+        logits_trace.append(np.asarray(masked_logits[0], dtype=np.float32).tolist())
+
+    return {
+        "action_trace": action_trace,
+        "action_trace_labels": [action_label(action) for action in action_trace],
+        "final_action": action_trace[-1],
+        "first_pick_step": next(
+            (step_idx for step_idx, action in enumerate(action_trace) if action >= 5),
+            None,
+        ),
+        "masked_logits_trace": logits_trace,
+    }
+
+
+def probe_navigation_semantics(doer, doer_params, nav_obs, fsq_levels, sequence_length):
     results = {"doer_a": {}, "doer_b": {}}
     zero_menu = jnp.zeros((1, 4, 5, 5, 3), dtype=jnp.float32)
 
     for doer_idx, doer_key in enumerate(("doer_a", "doer_b")):
         local_obs = nav_obs["local_views"][doer_idx][None, ...]
         proprioception = nav_obs["proprioceptions"][doer_idx][None, ...]
-        for word in all_messages(fsq_levels):
-            message = jnp.asarray([word], dtype=jnp.float32)
-            action = run_doer(
+        for message_sequence in all_message_sequences(fsq_levels, sequence_length):
+            rollout = run_doer_sequence(
                 doer,
                 doer_params,
-                carry,
                 local_obs,
                 proprioception,
-                message,
+                message_sequence,
                 zero_menu,
                 pick_only_phase=False,
             )
-            results[doer_key][str(word)] = NAV_ACTION_LABELS[action]
+            results[doer_key][message_sequence_key(message_sequence)] = {
+                "action_trace": rollout["action_trace_labels"],
+                "final_action": NAV_ACTION_LABELS[rollout["final_action"]],
+            }
     return results
 
 
-def probe_selection_semantics(doer, doer_params, pick_env, pick_obs, fsq_levels, distractor_packs):
-    carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+def probe_selection_semantics(
+    doer,
+    doer_params,
+    pick_env,
+    pick_obs,
+    fsq_levels,
+    distractor_packs,
+    sequence_length,
+):
     bank = pick_env.item_bank
     num_items = int(bank.shape[0])
     results = {"doer_a": {}, "doer_b": {}}
@@ -187,15 +248,16 @@ def probe_selection_semantics(doer, doer_params, pick_env, pick_obs, fsq_levels,
         local_obs = pick_obs["local_views"][doer_idx][None, ...]
         proprioception = pick_obs["proprioceptions"][doer_idx][None, ...]
 
-        for word in all_messages(fsq_levels):
-            message = jnp.asarray([word], dtype=jnp.float32)
+        for message_sequence in all_message_sequences(fsq_levels, sequence_length):
             per_target = {}
 
             for target_id in range(num_items):
-                target_hits = 0
+                first_pick_target_hits = 0
+                final_pick_target_hits = 0
                 total_trials = 0
-                chosen_objects = []
-                stayed = 0
+                first_pick_objects = []
+                final_pick_objects = []
+                no_pick = 0
                 for distractors in distractor_packs_for_target(
                     target_id,
                     num_items=num_items,
@@ -206,58 +268,96 @@ def probe_selection_semantics(doer, doer_params, pick_env, pick_obs, fsq_levels,
                         menu_ids = base_menu.copy()
                         menu_ids.insert(slot_idx, target_id)
                         menu_images = bank[jnp.asarray(menu_ids, dtype=jnp.int32)][None, ...]
-                        action = run_doer(
+                        rollout = run_doer_sequence(
                             doer,
                             doer_params,
-                            carry,
                             local_obs,
                             proprioception,
-                            message,
+                            message_sequence,
                             menu_images,
                             pick_only_phase=True,
                         )
                         total_trials += 1
-                        if action < 5:
-                            stayed += 1
-                            chosen_objects.append(None)
+                        first_pick_step = rollout["first_pick_step"]
+                        final_action = rollout["final_action"]
+
+                        if first_pick_step is None:
+                            no_pick += 1
+                            first_pick_objects.append(None)
+                        else:
+                            first_pick_action = rollout["action_trace"][first_pick_step]
+                            first_pick_item = int(menu_ids[first_pick_action - 5])
+                            first_pick_objects.append(first_pick_item)
+                            if first_pick_item == target_id:
+                                first_pick_target_hits += 1
+
+                        if final_action < 5:
+                            final_pick_objects.append(None)
+                        else:
+                            final_pick_item = int(menu_ids[final_action - 5])
+                            final_pick_objects.append(final_pick_item)
+                            if final_pick_item == target_id:
+                                final_pick_target_hits += 1
+
+                def dominant_choice(chosen_items):
+                    object_counts = {}
+                    for chosen_item in chosen_items:
+                        if chosen_item is None:
                             continue
-                        chosen_item = int(menu_ids[action - 5])
-                        chosen_objects.append(chosen_item)
-                        if chosen_item == target_id:
-                            target_hits += 1
+                        object_counts[chosen_item] = object_counts.get(chosen_item, 0) + 1
+                    dominant_choice_id = None
+                    dominant_choice_count = 0
+                    for choice_id, count in object_counts.items():
+                        if count > dominant_choice_count:
+                            dominant_choice_id = choice_id
+                            dominant_choice_count = count
+                    return dominant_choice_id, dominant_choice_count
 
-                object_counts = {}
-                for chosen_item in chosen_objects:
-                    if chosen_item is None:
-                        continue
-                    object_counts[chosen_item] = object_counts.get(chosen_item, 0) + 1
-
-                dominant_choice_id = None
-                dominant_choice_count = 0
-                for choice_id, count in object_counts.items():
-                    if count > dominant_choice_count:
-                        dominant_choice_id = choice_id
-                        dominant_choice_count = count
+                first_dominant_choice_id, first_dominant_choice_count = dominant_choice(first_pick_objects)
+                final_dominant_choice_id, final_dominant_choice_count = dominant_choice(final_pick_objects)
 
                 per_target[item_label(target_id)] = {
                     "item_id": target_id,
-                    "target_hit_rate": target_hits / total_trials if total_trials else 0.0,
-                    "stay_rate": stayed / total_trials if total_trials else 0.0,
-                    "dominant_chosen_object": (
-                        item_label(dominant_choice_id) if dominant_choice_id is not None else None
+                    "first_pick_target_hit_rate": (
+                        first_pick_target_hits / total_trials if total_trials else 0.0
                     ),
-                    "dominant_choice_rate": dominant_choice_count / total_trials if total_trials else 0.0,
+                    "final_pick_target_hit_rate": (
+                        final_pick_target_hits / total_trials if total_trials else 0.0
+                    ),
+                    "no_pick_rate": no_pick / total_trials if total_trials else 0.0,
+                    "dominant_first_pick_object": (
+                        item_label(first_dominant_choice_id)
+                        if first_dominant_choice_id is not None
+                        else None
+                    ),
+                    "dominant_first_pick_rate": (
+                        first_dominant_choice_count / total_trials if total_trials else 0.0
+                    ),
+                    "dominant_final_pick_object": (
+                        item_label(final_dominant_choice_id)
+                        if final_dominant_choice_id is not None
+                        else None
+                    ),
+                    "dominant_final_pick_rate": (
+                        final_dominant_choice_count / total_trials if total_trials else 0.0
+                    ),
                 }
 
             ranked_targets = sorted(
                 per_target.values(),
-                key=lambda entry: (entry["target_hit_rate"], entry["dominant_choice_rate"]),
+                key=lambda entry: (
+                    entry["first_pick_target_hit_rate"],
+                    entry["final_pick_target_hit_rate"],
+                    entry["dominant_final_pick_rate"],
+                ),
                 reverse=True,
             )
-            results[doer_key][str(word)] = {
-                "best_matching_object": ranked_targets[0]["dominant_chosen_object"],
+            results[doer_key][message_sequence_key(message_sequence)] = {
                 "best_target_label": item_label(ranked_targets[0]["item_id"]),
-                "best_target_hit_rate": ranked_targets[0]["target_hit_rate"],
+                "best_first_pick_hit_rate": ranked_targets[0]["first_pick_target_hit_rate"],
+                "best_final_pick_hit_rate": ranked_targets[0]["final_pick_target_hit_rate"],
+                "best_matching_first_pick_object": ranked_targets[0]["dominant_first_pick_object"],
+                "best_matching_final_pick_object": ranked_targets[0]["dominant_final_pick_object"],
                 "top_candidates": ranked_targets[:3],
                 "all_targets": per_target,
             }
@@ -265,23 +365,34 @@ def probe_selection_semantics(doer, doer_params, pick_env, pick_obs, fsq_levels,
     return results
 
 
-def build_summary(messages, navigation_results, selection_results):
+def build_summary(message_sequences, navigation_results, selection_results):
     lines = []
-    lines.append("Navigation actions are limited to: stay, up, right, down, left. There are no turning actions in this env.")
-    for word in messages:
-        word_key = str(word)
-        nav_a = navigation_results["doer_a"][word_key]
-        nav_b = navigation_results["doer_b"][word_key]
-        sel_a = selection_results["doer_a"][word_key]
-        sel_b = selection_results["doer_b"][word_key]
+    lines.append(
+        "Navigation actions are limited to: stay, up, right, down, left. There are no turning actions in this env."
+    )
+    lines.append(
+        "For selection, first_pick_* is the behaviorally meaningful metric because the environment would react to the first pick in the sequence."
+    )
+    for message_sequence in message_sequences:
+        seq_key = message_sequence_key(message_sequence)
+        nav_a = navigation_results["doer_a"][seq_key]
+        nav_b = navigation_results["doer_b"][seq_key]
+        sel_a = selection_results["doer_a"][seq_key]
+        sel_b = selection_results["doer_b"][seq_key]
         lines.append(
             " | ".join(
                 [
-                    f"msg={word_key}",
-                    f"nav_a={nav_a}",
-                    f"nav_b={nav_b}",
-                    f"obj_a={sel_a['best_target_label']} ({sel_a['best_target_hit_rate']:.2f})",
-                    f"obj_b={sel_b['best_target_label']} ({sel_b['best_target_hit_rate']:.2f})",
+                    f"msg_seq={seq_key}",
+                    f"nav_a={'->'.join(nav_a['action_trace'])}",
+                    f"nav_b={'->'.join(nav_b['action_trace'])}",
+                    (
+                        f"obj_a={sel_a['best_target_label']} "
+                        f"(first={sel_a['best_first_pick_hit_rate']:.2f}, final={sel_a['best_final_pick_hit_rate']:.2f})"
+                    ),
+                    (
+                        f"obj_b={sel_b['best_target_label']} "
+                        f"(first={sel_b['best_first_pick_hit_rate']:.2f}, final={sel_b['best_final_pick_hit_rate']:.2f})"
+                    ),
                 ]
             )
         )
@@ -304,6 +415,7 @@ def main():
             f"has {len(fsq_levels)}. Use an fsq-level list with {expected_message_dim} entries."
         )
     doer = Doer(fsq_levels=fsq_levels, num_actions=9)
+    message_sequences = all_message_sequences(fsq_levels, args.sequence_length)
 
     nav_env, nav_obs, pick_env, pick_obs = build_eval_contexts()
     navigation_results = probe_navigation_semantics(
@@ -311,6 +423,7 @@ def main():
         params["doer"],
         nav_obs,
         fsq_levels,
+        args.sequence_length,
     )
     selection_results = probe_selection_semantics(
         doer,
@@ -319,15 +432,17 @@ def main():
         pick_obs,
         fsq_levels,
         distractor_packs=args.distractor_packs,
+        sequence_length=args.sequence_length,
     )
 
-    messages = all_messages(fsq_levels)
-    summary_lines = build_summary(messages, navigation_results, selection_results)
+    summary_lines = build_summary(message_sequences, navigation_results, selection_results)
 
     report = {
         "checkpoint": str(checkpoint_path),
         "fsq_levels": list(fsq_levels),
         "num_messages": int(np.prod(np.asarray(fsq_levels, dtype=np.int32))),
+        "sequence_length": args.sequence_length,
+        "num_message_sequences": len(message_sequences),
         "item_labels": {str(item_id): item_label(item_id) for item_id in range(16)},
         "navigation_note": "No turning actions exist in the two-doer bottleneck env; navigation semantics are stay/up/right/down/left only.",
         "navigation_results": navigation_results,
@@ -340,8 +455,13 @@ def main():
     print("")
     print("Protocol Summary")
     print("=" * 72)
-    for line in summary_lines:
+    for line in summary_lines[: args.print_summary_limit]:
         print(line)
+    if len(summary_lines) > args.print_summary_limit:
+        print(
+            f"... truncated {len(summary_lines) - args.print_summary_limit} additional lines. "
+            f"See {output_path} for the full report."
+        )
 
 
 if __name__ == "__main__":
