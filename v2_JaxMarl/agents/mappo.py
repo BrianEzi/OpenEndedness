@@ -336,8 +336,9 @@ def calculate_two_doer_actor_losses(
     )
     doer_actor_loss = -jnp.minimum(doer_loss_unclipped, doer_loss_clipped).mean()
 
+    active_discrete_messages = discrete_messages[..., :active_message_bits]
     message_entropy, message_entropy_normalized, dominant_code_prob = (
-        _compute_message_entropy_metrics(discrete_messages, message_levels)
+        _compute_message_entropy_metrics(active_discrete_messages, message_levels)
     )
     seer_loss = seer_actor_loss - seer_entropy_coef * message_entropy
     doer_loss = doer_actor_loss - entropy_coef * doer_entropy
