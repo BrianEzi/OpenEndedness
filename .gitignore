@@ -211,3 +211,4 @@ __marimo__/
 
 # Weights and biases logging
 wandb/
+artifacts

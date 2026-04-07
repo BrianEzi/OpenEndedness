@@ -12,6 +12,10 @@ class TwoDoerState:
     goals: jnp.ndarray
     step_count: jnp.ndarray
     done: jnp.ndarray
+    target_items: jnp.ndarray
+    shuffled_menus: jnp.ndarray
+    selected_correctly: jnp.ndarray
+    has_selected: jnp.ndarray
 
 
 class TwoDoerBottleneckEnv:
@@ -87,11 +91,38 @@ class TwoDoerBottleneckEnv:
             ],
             dtype=jnp.float32,
         )
+        self.item_bank = self._build_item_bank()
 
     @property
     def num_actions(self) -> int:
-        # stay, up, right, down, left
-        return 5
+        # stay, up, right, down, left, pick_0, pick_1, pick_2, pick_3
+        return 9
+        
+    def _build_item_bank(self) -> jnp.ndarray:
+        colors = jnp.asarray([
+            [1.0, 0.2, 0.2],
+            [0.2, 1.0, 0.2],
+            [0.2, 0.4, 1.0],
+            [1.0, 1.0, 0.2],
+        ], dtype=jnp.float32)
+        shape0 = jnp.ones((5, 5), dtype=jnp.float32)
+        shape1 = jnp.zeros((5, 5), dtype=jnp.float32)
+        shape1 = shape1.at[2, 1:4].set(1.0)
+        shape1 = shape1.at[1:4, 2].set(1.0)
+        shape2 = jnp.zeros((5, 5), dtype=jnp.float32)
+        shape2 = shape2.at[1, 1].set(1.0)
+        shape2 = shape2.at[2, 2].set(1.0)
+        shape2 = shape2.at[3, 3].set(1.0)
+        shape2 = shape2.at[1, 3].set(1.0)
+        shape2 = shape2.at[3, 1].set(1.0)
+        shape3 = jnp.ones((5, 5), dtype=jnp.float32)
+        shape3 = shape3.at[1:4, 1:4].set(0.0)
+        shapes = jnp.stack([shape0, shape1, shape2, shape3])
+        bank = jnp.zeros((16, 5, 5, 3), dtype=jnp.float32)
+        for c in range(4):
+            for s in range(4):
+                bank = bank.at[c * 4 + s].set(shapes[s, :, :, None] * colors[c])
+        return bank
 
     def _build_wall_map(self) -> jnp.ndarray:
         wall_map = jnp.zeros((self.grid_height, self.grid_width), dtype=bool)
@@ -203,11 +234,18 @@ class TwoDoerBottleneckEnv:
             ],
             axis=0,
         )
+        
+        target_images = self.item_bank[state.target_items]
+        menu_images = self.item_bank[state.shuffled_menus]
+        menu_images = jnp.where(goals_reached[:, None, None, None, None], menu_images, 0.0)
+
         return {
             "global_map": global_map,
             "symbolic_state": symbolic_state,
             "local_views": local_views,
             "proprioceptions": proprioceptions,
+            "target_images": target_images,
+            "menu_images": menu_images,
         }
 
     def _goals_from_positions(self, positions: jnp.ndarray) -> jnp.ndarray:
@@ -240,11 +278,30 @@ class TwoDoerBottleneckEnv:
             sampled_positions,
         )
         goals = self._goals_from_positions(positions)
+        
+        key_target_a, key_target_b, key_menu_a, key_menu_b = jax.random.split(key, 4)
+        target_a = jax.random.randint(key_target_a, (), 0, 16)
+        target_b = jax.random.randint(key_target_b, (), 0, 16)
+        
+        def make_menu(rng_key, target):
+            p = jnp.where(jnp.arange(16) == target, 0.0, 1.0 / 15.0)
+            distractors = jax.random.choice(rng_key, jnp.arange(16), shape=(3,), replace=False, p=p)
+            menu = jnp.concatenate([jnp.array([target]), distractors])
+            _, shuffle_key = jax.random.split(rng_key)
+            return jax.random.permutation(shuffle_key, menu)
+            
+        menu_a = make_menu(key_menu_a, target_a)
+        menu_b = make_menu(key_menu_b, target_b)
+        
         state = TwoDoerState(
             positions=positions,
             goals=goals,
             step_count=jnp.asarray(0, dtype=jnp.int32),
             done=jnp.asarray(False),
+            target_items=jnp.array([target_a, target_b]),
+            shuffled_menus=jnp.stack([menu_a, menu_b]),
+            selected_correctly=jnp.array([False, False]),
+            has_selected=jnp.array([False, False]),
         )
         return self._split_observations(state), state
 
@@ -314,12 +371,29 @@ class TwoDoerBottleneckEnv:
                 "collision_penalty": zeros,
                 "goal_distance": self._manhattan_distance(reset_state.positions, reset_state.goals),
                 "success": jnp.asarray(False),
+                "failed": jnp.asarray(False),
             }
             return reset_obs, reset_state, zeros, jnp.asarray(False), info
 
         def step_branch(_):
+            nav_actions = jnp.where(actions < 5, actions, 0)
+            select_actions = actions - 5
+            is_selecting = actions >= 5
+            at_goal = jnp.all(state.positions == state.goals, axis=-1)
+
+            valid_selection = jnp.logical_and(is_selecting, at_goal)
+            valid_selection = jnp.logical_and(valid_selection, ~state.has_selected)
+
+            chosen_item = jnp.take_along_axis(state.shuffled_menus, select_actions[:, None], axis=1)[:, 0]
+            is_correct = chosen_item == state.target_items
+            
+            new_has_selected = jnp.logical_or(state.has_selected, valid_selection)
+            new_selected_correctly = jnp.logical_or(state.selected_correctly, jnp.logical_and(valid_selection, is_correct))
+            
             old_distances = self._manhattan_distance(state.positions, state.goals)
-            next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, actions)
+            next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
+            next_positions = jnp.where(is_selecting[:, None], state.positions, next_positions)
+            
             new_distances = self._manhattan_distance(next_positions, state.goals)
             progress_reward_per_doer = (old_distances - new_distances) * self.progress_reward_scale
             progress_reward = progress_reward_per_doer.sum()
@@ -327,7 +401,10 @@ class TwoDoerBottleneckEnv:
             collision_penalty = (
                 self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
             )
-            success = jnp.all(next_positions == state.goals)
+            
+            success = jnp.all(new_selected_correctly)
+            failed = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
+            
             task_reward = jnp.where(success, self.goal_reward, jnp.asarray(0.0, dtype=jnp.float32))
             reward = (
                 task_reward
@@ -340,7 +417,11 @@ class TwoDoerBottleneckEnv:
                 positions=next_positions,
                 goals=state.goals,
                 step_count=state.step_count + 1,
-                done=jnp.logical_or(success, state.step_count + 1 >= self.max_steps),
+                done=jnp.logical_or(jnp.logical_or(success, failed), state.step_count + 1 >= self.max_steps),
+                target_items=state.target_items,
+                shuffled_menus=state.shuffled_menus,
+                selected_correctly=new_selected_correctly,
+                has_selected=new_has_selected,
             )
             info = {
                 "task_reward": task_reward,
@@ -350,6 +431,7 @@ class TwoDoerBottleneckEnv:
                 "collision_penalty": collision_penalty,
                 "goal_distance": new_distances,
                 "success": success,
+                "failed": failed,
             }
             return self._split_observations(next_state), next_state, reward, next_state.done, info
 
@@ -413,5 +495,36 @@ class TwoDoerBottleneckEnv:
             triangle_mask = right_triangle if agent_idx == 0 else left_triangle
             tile_view[triangle_mask] = np.asarray(self._agent_colors[agent_idx])
             frame[y0:(row + 1) * tile, x0:(col + 1) * tile] = tile_view
+
+        # Render Item Targets at goals
+        bank = np.asarray(self.item_bank)
+        for agent_idx in range(self.num_doers):
+            target_item = int(np.asarray(state.target_items)[agent_idx])
+            target_img = bank[target_item] # (5, 5, 3)
+            # scale 5x5 to inset region
+            goal_row, goal_col = np.asarray(state.goals[agent_idx]).tolist()
+            y0 = goal_row * tile
+            x0 = goal_col * tile
+            # upscale target_img to 15x15
+            target_upscaled = np.repeat(np.repeat(target_img, 3, axis=0), 3, axis=1)
+            offset_y, offset_x = (tile - 15) // 2, (tile - 15) // 2
+            
+            # Place target in center of goal
+            frame[
+                y0 + offset_y : y0 + offset_y + 15, 
+                x0 + offset_x : x0 + offset_x + 15
+            ] = target_upscaled
+            
+            # Render menu options when goal is reached
+            if bool(np.asarray(state.positions[agent_idx] == state.goals[agent_idx]).all()):
+                menus = np.asarray(state.shuffled_menus[agent_idx])
+                for m_idx, option_id in enumerate(menus):
+                    opt_img = bank[option_id]
+                    opt_upscaled = np.repeat(np.repeat(opt_img, 3, axis=0), 3, axis=1)
+                    # draw menu below the grid or adjacent
+                    my0 = y0 - (m_idx + 1) * tile if agent_idx == 1 else y0 + (m_idx + 1) * tile
+                    # clip boundary
+                    my0 = max(0, min(my0, (self.grid_height - 1) * tile))
+                    frame[my0 + offset_y : my0 + offset_y + 15, x0 + offset_x : x0 + offset_x + 15] = opt_upscaled
 
         return (frame * 255.0).astype(np.uint8)

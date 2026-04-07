@@ -17,6 +17,8 @@ class Transition:
     local_obs: chex.Array   # For the Doer
     proprioception: chex.Array # For the Doer
     message: chex.Array     # For CIC and Heatmap logging
+    target_images: chex.Array
+    menu_images: chex.Array
     doer_action: chex.Array
     doer_log_prob: chex.Array
     seer_action: chex.Array
@@ -42,6 +44,8 @@ class TwoDoerTransition:
     local_obs: chex.Array
     proprioception: chex.Array
     message: chex.Array
+    target_images: chex.Array
+    menu_images: chex.Array
     doer_action: chex.Array
     doer_log_prob: chex.Array
     value: chex.Array
@@ -121,6 +125,7 @@ def calculate_actor_losses(
             seer_carry,
             transition_step.global_obs,
             transition_step.symbolic_obs,
+            transition_step.target_images,
         )
         
         # Doer Forward Pass
@@ -129,7 +134,8 @@ def calculate_actor_losses(
             doer_carry,
             transition_step.local_obs,
             transition_step.proprioception,
-            discrete_message
+            discrete_message,
+            transition_step.menu_images
         )
         return (next_seer_carry, next_doer_carry), (
             logits,
@@ -249,6 +255,7 @@ def calculate_two_doer_actor_losses(
             seer_carry,
             transition_step.global_obs,
             transition_step.symbolic_obs,
+            transition_step.target_images,
         )
         batch_size, num_doers = transition_step.local_obs.shape[:2]
         flat_local_obs = transition_step.local_obs.reshape(
@@ -270,6 +277,7 @@ def calculate_two_doer_actor_losses(
             flat_local_obs,
             flat_proprioception,
             flat_messages,
+            transition_step.menu_images.reshape((batch_size * num_doers,) + transition_step.menu_images.shape[2:])
         )
         next_doer_carry = jax.tree_util.tree_map(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),

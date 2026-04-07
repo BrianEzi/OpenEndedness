@@ -9,7 +9,7 @@ class Doer(nn.Module):
     Operates on local observations and executes commands via discrete actions.
     """
     fsq_levels: Sequence[int]
-    num_actions: int = 6 # e.g., Move N/S/E/W, Toggle, Pick Up
+    num_actions: int = 9 # e.g., Move N/S/E/W, Toggle, Pick 0/1/2/3
     lstm_features: int = 128
     embed_dim: int = 16
 
@@ -19,7 +19,8 @@ class Doer(nn.Module):
         carry: Tuple[jnp.ndarray, jnp.ndarray],
         local_obs: jnp.ndarray,
         proprioception: jnp.ndarray,
-        message: jnp.ndarray
+        message: jnp.ndarray,
+        menu_images: jnp.ndarray
     ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
         """
         Args:
@@ -27,6 +28,7 @@ class Doer(nn.Module):
             local_obs: Egocentric 3x3 grid view. Expected shape (batch, 3, 3, C) or zeros.
             proprioception: Internal states (e.g., carrying item). Expected shape (batch, features).
             message: The quantized $m_t$ vector from the Seer. Expected shape (batch, d).
+            menu_images: The 4 option images. Expected shape (batch, 4, 5, 5, 3).
             
         Returns:
             new_carry: Updated LSTM state for the next timestep $t+1$.
@@ -50,11 +52,20 @@ class Doer(nn.Module):
         p = nn.Dense(features=16)(proprioception)
         p = nn.relu(p)
         
-        # 4. Fusion
-        # Combine local vision, proprioception, and the embedded command
-        fused_features = jnp.concatenate([x_flat, p, message_features], axis=-1)
+        # 4. Menu Images Encoder
+        # menu_images shape is (batch, 4, 5, 5, 3)
+        mi_flat = menu_images.reshape((-1, 5, 5, 3))
+        mi_conv1 = nn.Conv(features=16, kernel_size=(3, 3))(mi_flat)
+        mi_conv1 = nn.relu(mi_conv1)
+        mi_conv2 = nn.Conv(features=32, kernel_size=(3, 3))(mi_conv1)
+        mi_conv2 = nn.relu(mi_conv2)
+        mi_feats = mi_conv2.reshape((menu_images.shape[0], -1))
         
-        # 5. Reasoning Module: LSTM
+        # 5. Fusion
+        # Combine local vision, proprioception, menu images, and the embedded command
+        fused_features = jnp.concatenate([x_flat, p, mi_feats, message_features], axis=-1)
+        
+        # 6. Reasoning Module: LSTM
         # Critical for integrating sequences of commands (e.g., maintaining a "Wait" state)
         lstm_cell = nn.LSTMCell(features=self.lstm_features)
         new_carry, lstm_out = lstm_cell(carry, fused_features)

@@ -57,7 +57,8 @@ def make_rollout_step(
             {"params": params["seer"]}, 
             seer_carry, 
             global_map, 
-            symbolic_obs
+            symbolic_obs,
+            env_obs["target_images"]
         )
         
         # 2. Doer Forward Pass (Motor Cortex)
@@ -70,7 +71,8 @@ def make_rollout_step(
             doer_carry, 
             local_obs, 
             proprioception, 
-            discrete_message
+            discrete_message,
+            env_obs["menu_images"]
         )
         _, null_action_logits = doer_apply_fn(
             {"params": params["doer"]},
@@ -78,6 +80,7 @@ def make_rollout_step(
             local_obs,
             proprioception,
             jnp.zeros_like(discrete_message),
+            env_obs["menu_images"]
         )
         
         # 3. Action Selection
@@ -157,6 +160,8 @@ def make_rollout_step(
             local_obs=local_obs,
             proprioception=proprioception,
             message=discrete_message,
+            target_images=env_obs["target_images"],
+            menu_images=env_obs["menu_images"],
             doer_action=doer_action,
             doer_log_prob=doer_log_prob,
             seer_action=seer_action,
@@ -320,6 +325,7 @@ def make_two_doer_rollout_step(
             seer_carry,
             global_map,
             symbolic_obs,
+            env_obs["target_images"]
         )
 
         batch_size, num_doers = local_obs.shape[:2]
@@ -340,6 +346,7 @@ def make_two_doer_rollout_step(
             flat_local_obs,
             flat_proprioception,
             flat_messages,
+            env_obs["menu_images"].reshape((batch_size * num_doers,) + env_obs["menu_images"].shape[2:])
         )
         next_doer_carry = jax.tree_util.tree_map(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
@@ -373,6 +380,8 @@ def make_two_doer_rollout_step(
             local_obs=local_obs,
             proprioception=proprioception,
             message=discrete_messages,
+            target_images=env_obs["target_images"],
+            menu_images=env_obs["menu_images"],
             doer_action=doer_action,
             doer_log_prob=doer_log_prob,
             value=value,

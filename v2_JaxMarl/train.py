@@ -131,11 +131,15 @@ def collect_message_action_trace(
         local_view = obs["local_view"][None, ...]
         proprioception = obs["proprioception"][None, ...]
 
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
         seer_carry, message, _, _ = seer.apply(
             {"params": params["seer"]},
             seer_carry,
             global_map,
             symbolic_state,
+            target_images,
         )
         doer_carry, action_logits = doer.apply(
             {"params": params["doer"]},
@@ -143,6 +147,7 @@ def collect_message_action_trace(
             local_view,
             proprioception,
             message,
+            menu_images[:, 0],
         )
 
         message_np = np.asarray(message[0]).round(3).tolist()
@@ -235,11 +240,15 @@ def evaluate_greedy_episode(
         local_view = obs["local_view"][None, ...]
         proprioception = obs["proprioception"][None, ...]
 
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
         seer_carry, message, _, seer_nav_logits = seer.apply(
             {"params": params["seer"]},
             seer_carry,
             global_map,
             symbolic_state,
+            target_images,
         )
 
         if int(control_mode) == env.SEER_NAV_PHASE:
@@ -251,6 +260,7 @@ def evaluate_greedy_episode(
                 local_view,
                 proprioception,
                 message,
+                menu_images[:, 0],
             )
             action = jnp.argmax(action_logits[0]).astype(jnp.int32)
 
@@ -326,11 +336,15 @@ def _run_two_doer_greedy_episode(
         local_views = obs["local_views"][None, ...]
         proprioceptions = obs["proprioceptions"][None, ...]
 
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
         seer_carry, messages, _, _ = seer.apply(
             {"params": params["seer"]},
             seer_carry,
             global_map,
             symbolic_state,
+            target_images,
         )
 
         batch_size, num_doers = local_views.shape[:2]
@@ -349,6 +363,7 @@ def _run_two_doer_greedy_episode(
             flat_local_views,
             flat_proprioceptions,
             flat_messages,
+            menu_images.reshape((batch_size * num_doers,) + menu_images.shape[2:]),
         )
         doer_carry = jax.tree_util.tree_map(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
@@ -609,11 +624,15 @@ def visualize_two_doer_episode(
         local_views = obs["local_views"][None, ...]
         proprioceptions = obs["proprioceptions"][None, ...]
 
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
         seer_carry, messages, _, _ = seer.apply(
             {"params": params["seer"]},
             seer_carry,
             global_map,
             symbolic_state,
+            target_images,
         )
 
         batch_size, num_doers = local_views.shape[:2]
@@ -632,6 +651,7 @@ def visualize_two_doer_episode(
             flat_local_views,
             flat_proprioceptions,
             flat_messages,
+            menu_images.reshape((batch_size * num_doers,) + menu_images.shape[2:]),
         )
         doer_carry = jax.tree_util.tree_map(
             lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
@@ -729,8 +749,10 @@ def run_two_doer_training(config):
     init_seer_carry = seer.initialize_carry(1, 128)
     init_doer_carry = doer.initialize_carry(1, 128)
 
-    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym)["params"]
-    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
+    dummy_target = env_obs["target_images"][:1]
+    dummy_menu = env_obs["menu_images"][:1, 0]
+    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym, dummy_target)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg, dummy_menu)["params"]
     critic_params = critic.init(critic_init_rng, dummy_map)["params"]
 
     seer_carry = seer.initialize_carry(config["num_envs"], 128)
@@ -993,7 +1015,7 @@ def main():
         "num_steps": 64,
         "total_timesteps": 3_000_000,
         "env_id": "Navix-Empty-Random-8x8-v0",
-        "fsq_levels": [4, 4],
+        "fsq_levels": [2, 2, 2, 2],
         "seed": 42,
         "grid_height": 10,
         "grid_width": 12,
@@ -1096,8 +1118,10 @@ def main():
     init_seer_carry = seer.initialize_carry(1, 128)
     init_doer_carry = doer.initialize_carry(1, 128)
 
-    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym)["params"]
-    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg)["params"]
+    dummy_target = env_obs["target_images"][:1]
+    dummy_menu = env_obs["menu_images"][:1, 0]
+    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym, dummy_target)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg, dummy_menu)["params"]
     critic_params = critic.init(critic_init_rng, dummy_map)["params"]
 
     seer_carry = seer.initialize_carry(config["num_envs"], 128)
@@ -1478,5 +1502,65 @@ def main():
                         fixed_start_position,
                     )
 
+    # END OF TRAINING
+    probe_and_save_codebook(env, params, rng, doer, config["fsq_levels"])
+
+def probe_and_save_codebook(env, params, rng, doer, fsq_levels):
+    import itertools
+    import json
+    
+    print("\n" + "="*72)
+    print("PROBING CODEBOOK AT END OF TRAINING")
+    print("="*72)
+    
+    ranges = [list(range(l)) for l in fsq_levels]
+    words = list(itertools.product(*ranges))
+    
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    
+    dummy_local = jnp.zeros((1, 3, 3, 5), dtype=jnp.float32)
+    dummy_prop = jnp.zeros((1, env.num_doers + 3), dtype=jnp.float32)
+    rng, key = jax.random.split(rng)
+    bank = env._build_item_bank()
+    dummy_menu = jnp.stack([bank[0], bank[1], bank[2], bank[3]])[None, ...]
+    
+    codebook_mapping = {}
+    
+    for word in words:
+        message_array = jnp.array([word], dtype=jnp.float32)
+        _, action_logits = doer.apply(
+            {"params": params["doer"]},
+            doer_carry,
+            dummy_local,
+            dummy_prop,
+            message_array,
+            dummy_menu
+        )
+        action = int(jnp.argmax(action_logits[0]))
+        if action < 5:
+            action_desc = ["stay", "up", "right", "down", "left"][action]
+        else:
+            action_desc = f"pick_option_{action-5}"
+        
+        word_str = str(word)
+        codebook_mapping[word_str] = action_desc
+        print(f"Message {word_str} -> Doer Action: {action_desc}")
+        
+    with open("final_codebook.json", "w") as f:
+        json.dump(codebook_mapping, f, indent=4)
+        
+    try:
+        from flax.training import checkpoints
+        import os
+        os.makedirs("checkpoints", exist_ok=True)
+        checkpoints.save_checkpoint(ckpt_dir="checkpoints/", target=params, step=1000, overwrite=True)
+        print("Saved final model weights to checkpoints/")
+    except ImportError:
+        pass
+    print("Codebook saved to final_codebook.json")
+
 if __name__ == "__main__":
     main()
+
+
+

@@ -21,18 +21,20 @@ class Seer(nn.Module):
         self, 
         carry: Tuple[jnp.ndarray, jnp.ndarray], 
         map_obs: jnp.ndarray, 
-        symbolic_obs: jnp.ndarray
+        symbolic_obs: jnp.ndarray,
+        target_images: jnp.ndarray
     ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         Args:
             carry: A tuple of (hidden_state, cell_state) for the LSTM.
             map_obs: The Global Map View grid. Expected shape (batch, H, W, C).
             symbolic_obs: Guard Schedule + Sensor States. Expected shape (batch, features).
+            target_images: The items the Doers must select. Expected shape (batch, 2, 5, 5, 3).
             
         Returns:
             new_carry: Updated LSTM state for the next timestep $t+1$.
             discrete_message: The quantized $m_t$ vector sent to the Doer.
-            thought_vector: The continuous pre-quantization vector (useful for logging/critic).
+            thought_vector: The continuous pre-quantization vector.
             navigation_logits: Action logits used while the Seer is embodied.
         """
         
@@ -50,11 +52,20 @@ class Seer(nn.Module):
         y = nn.Dense(features=64)(symbolic_obs)
         y = nn.relu(y)
         
-        # 3. Fusion
-        # Concatenate the visual and symbolic pathways into a single representation 
-        fused_features = jnp.concatenate([x_flat, y], axis=-1)
+        # 3. Target Images Encoder
+        # target_images shape is (batch, 2, 5, 5, 3)
+        ti_flat = target_images.reshape((-1, 5, 5, 3))
+        ti_conv1 = nn.Conv(features=16, kernel_size=(3, 3))(ti_flat)
+        ti_conv1 = nn.relu(ti_conv1)
+        ti_conv2 = nn.Conv(features=32, kernel_size=(3, 3))(ti_conv1)
+        ti_conv2 = nn.relu(ti_conv2)
+        ti_feats = ti_conv2.reshape((target_images.shape[0], -1))
         
-        # 4. Reasoning Module: LSTM 
+        # 4. Fusion
+        # Concatenate the visual, symbolic, and target features
+        fused_features = jnp.concatenate([x_flat, y, ti_feats], axis=-1)
+        
+        # 5. Reasoning Module: LSTM 
         # Evaluates the current state in the context of the previous timestep [cite: 135]
         lstm_cell = nn.LSTMCell(features=self.lstm_features)
         new_carry, lstm_out = lstm_cell(carry, fused_features)
