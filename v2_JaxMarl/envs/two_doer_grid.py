@@ -373,6 +373,7 @@ class TwoDoerBottleneckEnv:
             zeros = jnp.asarray(0.0, dtype=jnp.float32)
             info = {
                 "task_reward": zeros,
+                "individual_selection_reward": zeros,
                 "progress_reward_per_doer": jnp.zeros((self.num_doers,), dtype=jnp.float32),
                 "step_penalty": zeros,
                 "wall_penalty": zeros,
