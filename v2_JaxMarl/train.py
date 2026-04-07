@@ -744,13 +744,13 @@ def print_two_doer_selection_level_banner(level, env, label="TWO-DOER SELECTION 
     if int(level) == 1:
         description = (
             "Pick_Object: doers are frozen at goal tiles, only object picks are allowed, "
-            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}, "
+            f"active_msg_bits={env.active_message_bits}, first_pick_only=1, "
             f"pick_object_listen_steps={env.pick_object_listen_steps}"
         )
     else:
         description = (
             "Full_Training: normal starts, corridor crossing, and object selection; "
-            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}"
+            f"active_msg_bits={env.active_message_bits}, first_pick_only=1"
         )
     print("")
     print("=" * 72)

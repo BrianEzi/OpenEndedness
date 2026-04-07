@@ -456,7 +456,6 @@ class TwoDoerBottleneckEnv:
             return reset_obs, reset_state, zeros, jnp.asarray(False), info
 
         def step_branch(_):
-            max_selection_attempts = self.max_selection_attempts
             phase_max_steps = self.phase_max_steps
             nav_actions = jnp.where(actions < 5, actions, 0)
             select_actions = actions - 5
@@ -475,17 +474,17 @@ class TwoDoerBottleneckEnv:
             is_correct = chosen_item == state.target_items
             
             new_selection_attempts = state.selection_attempts + valid_selection.astype(jnp.int32)
-            correct_selection = jnp.logical_and(valid_selection, is_correct)
-            wrong_selection = jnp.logical_and(valid_selection, ~is_correct)
+            first_selection = jnp.logical_and(valid_selection, state.selection_attempts == 0)
+            correct_selection = jnp.logical_and(first_selection, is_correct)
+            wrong_selection = jnp.logical_and(first_selection, ~is_correct)
             new_selected_correctly = jnp.logical_or(state.selected_correctly, correct_selection)
             new_first_selection_correct = jnp.logical_or(
                 state.first_selection_correct,
-                jnp.logical_and(correct_selection, new_selection_attempts == 1),
+                correct_selection,
             )
-            attempts_exhausted = new_selection_attempts >= max_selection_attempts
             new_has_selected = jnp.logical_or(
                 state.has_selected,
-                jnp.logical_or(new_selected_correctly, attempts_exhausted),
+                first_selection,
             )
 
             if self.is_pick_object_phase:
@@ -535,23 +534,15 @@ class TwoDoerBottleneckEnv:
             individual_selection_reward = (
                 correct_selection.astype(jnp.float32) * self.individual_selection_reward
             ).sum()
-            wrong_penalty_per_doer = jnp.where(
-                new_selection_attempts <= 1,
-                self.wrong_selection_penalty,
-                self.wrong_selection_penalty_after_first,
-            )
             wrong_selection_penalty = (
-                wrong_selection.astype(jnp.float32) * wrong_penalty_per_doer
+                wrong_selection.astype(jnp.float32) * self.wrong_selection_penalty
             ).sum()
             valid_selection_count = valid_selection.astype(jnp.float32).sum()
             correct_selection_count = correct_selection.astype(jnp.float32).sum()
 
-            all_success = jnp.all(new_selected_correctly)
             all_terminal = jnp.all(new_has_selected)
-            first_try_success = jnp.logical_and(
-                all_success,
-                jnp.all(new_first_selection_correct),
-            )
+            all_success = jnp.logical_and(all_terminal, jnp.all(new_first_selection_correct))
+            first_try_success = all_success
             
             team_completion_reward = jnp.where(
                 all_success,
