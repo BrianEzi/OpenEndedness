@@ -14,6 +14,7 @@ class TwoDoerState:
     done: jnp.ndarray
     target_items: jnp.ndarray
     shuffled_menus: jnp.ndarray
+    selected_correctly: jnp.ndarray
     has_selected: jnp.ndarray
     has_arrived: jnp.ndarray
     selected_option_idx: jnp.ndarray
@@ -432,7 +433,11 @@ class TwoDoerBottleneckEnv:
             any_failure = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
             all_success = jnp.all(new_selected_correctly)
             
-            team_completion_reward = jnp.where(all_success, self.goal_reward, jnp.asarray(0.0, dtype=jnp.float32))
+            team_completion_reward = jnp.where(
+                all_success,
+                self.goal_reward,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
             task_reward = team_completion_reward + individual_selection_reward
 
             reward = (
@@ -456,14 +461,15 @@ class TwoDoerBottleneckEnv:
                 selected_option_idx=new_selected_option_idx,
             )
             info = {
-                "task_reward": task_reward,
+                "task_reward": team_completion_reward,
+                "individual_selection_reward": individual_selection_reward,
                 "progress_reward_per_doer": progress_reward_per_doer,
                 "step_penalty": self.step_penalty,
                 "wall_penalty": wall_penalty,
                 "collision_penalty": collision_penalty,
                 "goal_distance": new_distances,
-                "success": success,
-                "failed": failed,
+                "success": all_success,
+                "failed": any_failure,
             }
             return self._split_observations(next_state), next_state, reward, next_state.done, info
 

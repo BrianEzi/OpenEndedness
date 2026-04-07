@@ -27,7 +27,10 @@ import navix as nx
 from eval.visualize import visualize_episode
 from eval.metrics import compute_two_doer_cic
 import numpy as np
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 from PIL import Image
 
 
@@ -45,6 +48,26 @@ class GlobalCritic(nn.Module):
         x = nn.relu(x)
         value = nn.Dense(features=self.output_dim)(x)
         return value
+
+
+def wandb_enabled(config) -> bool:
+    return bool(config.get("use_wandb", True))
+
+
+def maybe_init_wandb(config):
+    if not wandb_enabled(config):
+        return
+    if wandb is None:
+        raise ImportError(
+            "use_wandb=True but wandb is not installed. "
+            "Set config['use_wandb'] = False to disable Weights & Biases logging."
+        )
+    wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+
+
+def maybe_wandb_log(config, payload, **kwargs):
+    if wandb_enabled(config):
+        wandb.log(payload, **kwargs)
 
 
 def reset_curriculum_batch(
@@ -541,13 +564,15 @@ def log_curriculum_visualization(
         fixed_goal_position=fixed_goal_position,
         fixed_start_position=fixed_start_position,
     )
-    wandb.log(
-        {
-            "curriculum_reset_episode": wandb.Video(str(output_path), format="gif"),
-            "curriculum_reset_episode_solved": int(solved),
-        },
-        commit=False,
-    )
+    if wandb_enabled(config):
+        maybe_wandb_log(
+            config,
+            {
+                "curriculum_reset_episode": wandb.Video(str(output_path), format="gif"),
+                "curriculum_reset_episode_solved": int(solved),
+            },
+            commit=False,
+        )
 
 
 def save_two_doer_initial_visualization(env, state, config):
@@ -555,13 +580,15 @@ def save_two_doer_initial_visualization(env, state, config):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame = env.render(state)
     Image.fromarray(frame).save(output_path)
-    wandb.log(
-        {
-            "two_doer_initial_layout": wandb.Image(str(output_path)),
-            "two_doer_initial_layout_step": 0,
-        },
-        commit=True,
-    )
+    if wandb_enabled(config):
+        maybe_wandb_log(
+            config,
+            {
+                "two_doer_initial_layout": wandb.Image(str(output_path)),
+                "two_doer_initial_layout_step": 0,
+            },
+            commit=True,
+        )
     print(f"Initial two-doer layout saved to {output_path}")
     return output_path
 
@@ -680,14 +707,16 @@ def visualize_two_doer_episode(
             duration=150,
             loop=0,
         )
-        wandb.log(
-            {
-                "two_doer_eval_episode": wandb.Video(str(output_path), format="gif"),
-                "two_doer_eval_episode_solved": int(success),
-                "two_doer_eval_episode_step": int(update),
-            },
-            commit=True,
-        )
+        if wandb_enabled(config):
+            maybe_wandb_log(
+                config,
+                {
+                    "two_doer_eval_episode": wandb.Video(str(output_path), format="gif"),
+                    "two_doer_eval_episode_solved": int(success),
+                    "two_doer_eval_episode_step": int(update),
+                },
+                commit=True,
+            )
         print(f"Two-doer eval episode saved to {output_path}")
 
     return rng, output_path, success
@@ -860,34 +889,36 @@ def run_two_doer_training(config):
         )
 
         if update % 10 == 0:
-            wandb.log(
-                {
-                    "task_variant": config["task_variant"],
-                    "doer_perception_level": env.doer_perception_level,
-                    "curriculum_fixed_starts": int(curriculum_active),
-                    "curriculum_eval_gate_passed": int(
-                        rollout_success_rate >= config["curriculum_rollout_success_threshold"]
-                    ),
-                    "mastered_start_positions": mastered_start_positions,
-                    "rollout_success_rate": rollout_success_rate,
-                    "team_reward": trajectory_batch.reward.mean(),
-                    "task_reward": trajectory_batch.task_reward.mean(),
-                    "progress_reward_doer_a": trajectory_batch.progress_reward_per_doer[..., 0].mean(),
-                    "progress_reward_doer_b": trajectory_batch.progress_reward_per_doer[..., 1].mean(),
-                    "step_penalty": trajectory_batch.step_penalty_component.mean(),
-                    "wall_penalty": trajectory_batch.wall_penalty_component.mean(),
-                    "collision_penalty": trajectory_batch.collision_penalty_component.mean(),
-                    "cic_score": cic_score,
-                    "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
-                    "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
-                    "critic_loss": critic_metrics.get("critic_loss", 0.0),
-                    "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
-                    "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
-                    "message_distribution": wandb.Histogram(
-                        np.asarray(message_stats["message_codes"])
-                    ),
-                }
-            )
+            if wandb_enabled(config):
+                maybe_wandb_log(
+                    config,
+                    {
+                        "task_variant": config["task_variant"],
+                        "doer_perception_level": env.doer_perception_level,
+                        "curriculum_fixed_starts": int(curriculum_active),
+                        "curriculum_eval_gate_passed": int(
+                            rollout_success_rate >= config["curriculum_rollout_success_threshold"]
+                        ),
+                        "mastered_start_positions": mastered_start_positions,
+                        "rollout_success_rate": rollout_success_rate,
+                        "team_reward": trajectory_batch.reward.mean(),
+                        "task_reward": trajectory_batch.task_reward.mean(),
+                        "progress_reward_doer_a": trajectory_batch.progress_reward_per_doer[..., 0].mean(),
+                        "progress_reward_doer_b": trajectory_batch.progress_reward_per_doer[..., 1].mean(),
+                        "step_penalty": trajectory_batch.step_penalty_component.mean(),
+                        "wall_penalty": trajectory_batch.wall_penalty_component.mean(),
+                        "collision_penalty": trajectory_batch.collision_penalty_component.mean(),
+                        "cic_score": cic_score,
+                        "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                        "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                        "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                        "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
+                        "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
+                        "message_distribution": wandb.Histogram(
+                            np.asarray(message_stats["message_codes"])
+                        ),
+                    }
+                )
             print(
                 f"Update {update}/{num_updates} | "
                 f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
@@ -939,7 +970,8 @@ def run_two_doer_training(config):
                     f"gate_passed=0 skipped "
                     f"(rollout_success_rate={float(rollout_success_rate):.3f})"
                 )
-            wandb.log(
+            maybe_wandb_log(
+                config,
                 {
                     "curriculum_eval_gate_passed": int(gate_passed),
                     "greedy_episode_solved": int(greedy_solved),
@@ -1034,6 +1066,7 @@ def main():
         "eval_every": 300,
         "curriculum_rollout_success_threshold": 0.97,
         "visualize_every": 200,
+        "use_wandb": True,
         "use_two_doer_start_curriculum": True,
         "two_doer_random_starts_only": False,
         "two_doer_required_start_positions": 3,
@@ -1050,7 +1083,7 @@ def main():
         "visualize_dir": "artifacts/episodes",
     }
     
-    wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+    maybe_init_wandb(config)
 
     print(f"backend: {jax.default_backend()}")
     print(f"devices: {jax.devices()}")
@@ -1265,22 +1298,26 @@ def main():
                     phase_label == "communication_random_full"
                 ),
             }
-            wandb.log({
-                "phase_label": phase_label,
-                "doer_perception_level": config["doer_perception_level"],
-                "current_start_success_streak": current_start_success_streak,
-                "rollout_success_rate": rollout_success_rate,
-                "task_reward": trajectory_batch.task_reward.mean(),
-                "progress_reward": trajectory_batch.progress_reward.mean(),
-                "cic_score": cic_score,
-                "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
-                "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
-                "critic_loss": critic_metrics.get("critic_loss", 0.0),
-                "message_distribution": wandb.Histogram(
-                    np.asarray(message_stats["message_codes"])
-                ),
-                **phase_indicators,
-            })
+            if wandb_enabled(config):
+                maybe_wandb_log(
+                    config,
+                    {
+                        "phase_label": phase_label,
+                        "doer_perception_level": config["doer_perception_level"],
+                        "current_start_success_streak": current_start_success_streak,
+                        "rollout_success_rate": rollout_success_rate,
+                        "task_reward": trajectory_batch.task_reward.mean(),
+                        "progress_reward": trajectory_batch.progress_reward.mean(),
+                        "cic_score": cic_score,
+                        "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                        "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                        "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                        "message_distribution": wandb.Histogram(
+                            np.asarray(message_stats["message_codes"])
+                        ),
+                        **phase_indicators,
+                    },
+                )
             print(
                 f"Update {update}/{num_updates} | "
                 f"Phase: {phase_label} | "
@@ -1561,6 +1598,3 @@ def probe_and_save_codebook(env, params, rng, doer, fsq_levels):
 
 if __name__ == "__main__":
     main()
-
-
-
