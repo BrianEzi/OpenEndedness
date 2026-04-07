@@ -129,7 +129,7 @@ class TwoDoerBottleneckEnv:
 
     @property
     def active_message_bits(self) -> int:
-        return 3 if self.selection_phase_level == 1 else 4
+        return 4
 
     @property
     def is_pick_object_phase(self) -> bool:
