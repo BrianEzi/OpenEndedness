@@ -194,8 +194,9 @@ def calculate_actor_losses(
     doer_actor_loss = -jnp.minimum(doer_loss_unclipped, doer_loss_clipped).mean()
     doer_actor_loss = jnp.where(communication_mode, doer_actor_loss, 0.0)
 
+    active_discrete_messages = discrete_messages[..., :active_message_bits]
     message_entropy, message_entropy_normalized, dominant_code_prob = (
-        _compute_message_entropy_metrics(discrete_messages, message_levels)
+        _compute_message_entropy_metrics(active_discrete_messages, message_levels)
     )
     seer_bonus = jnp.where(communication_mode, message_entropy, seer_nav_entropy)
 

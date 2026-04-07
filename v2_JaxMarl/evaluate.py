@@ -76,6 +76,16 @@ def restore_params(checkpoint_path: Path):
     return params
 
 
+def infer_message_dim_from_params(params) -> int:
+    try:
+        return int(params["doer"]["Dense_0"]["kernel"].shape[0])
+    except KeyError as exc:
+        raise KeyError(
+            "Could not infer message dimension from checkpoint params at "
+            "params['doer']['Dense_0']['kernel']."
+        ) from exc
+
+
 def item_label(item_id: int) -> str:
     color = COLOR_NAMES[item_id // 4]
     shape = SHAPE_NAMES[item_id % 4]
@@ -286,6 +296,13 @@ def main():
 
     fsq_levels = parse_fsq_levels(args.fsq_levels)
     params = restore_params(checkpoint_path)
+    expected_message_dim = infer_message_dim_from_params(params)
+    if len(fsq_levels) != expected_message_dim:
+        raise ValueError(
+            "Checkpoint/message mismatch: the restored doer expects "
+            f"{expected_message_dim} message dimensions, but --fsq-levels {list(fsq_levels)} "
+            f"has {len(fsq_levels)}. Use an fsq-level list with {expected_message_dim} entries."
+        )
     doer = Doer(fsq_levels=fsq_levels, num_actions=9)
 
     nav_env, nav_obs, pick_env, pick_obs = build_eval_contexts()
