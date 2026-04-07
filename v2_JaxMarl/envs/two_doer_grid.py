@@ -14,9 +14,9 @@ class TwoDoerState:
     done: jnp.ndarray
     target_items: jnp.ndarray
     shuffled_menus: jnp.ndarray
-    selected_correctly: jnp.ndarray
     has_selected: jnp.ndarray
     has_arrived: jnp.ndarray
+    selected_option_idx: jnp.ndarray
 
 
 class TwoDoerBottleneckEnv:
@@ -32,6 +32,7 @@ class TwoDoerBottleneckEnv:
         progress_reward_scale: float = 0.05,
         goal_reward: float = 1.0,
         arrival_reward: float = 0.5,
+        individual_selection_reward: float = 0.5,
         step_penalty: float = 0.03,
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
@@ -57,6 +58,7 @@ class TwoDoerBottleneckEnv:
         self.progress_reward_scale = jnp.asarray(progress_reward_scale, dtype=jnp.float32)
         self.goal_reward = jnp.asarray(goal_reward, dtype=jnp.float32)
         self.arrival_reward = jnp.asarray(arrival_reward, dtype=jnp.float32)
+        self.individual_selection_reward = jnp.asarray(individual_selection_reward, dtype=jnp.float32)
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
@@ -306,6 +308,7 @@ class TwoDoerBottleneckEnv:
             selected_correctly=jnp.array([False, False]),
             has_selected=jnp.array([False, False]),
             has_arrived=jnp.array([False, False]),
+            selected_option_idx=jnp.array([-1, -1]),
         )
         return self._split_observations(state), state
 
@@ -396,7 +399,10 @@ class TwoDoerBottleneckEnv:
             
             old_distances = self._manhattan_distance(state.positions, state.goals)
             next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
-            next_positions = jnp.where(is_selecting[:, None], state.positions, next_positions)
+            
+            # Lock position if selecting on this step or if already selected previously
+            is_locked = jnp.logical_or(is_selecting, state.has_selected)
+            next_positions = jnp.where(is_locked[:, None], state.positions, next_positions)
             
             new_distances = self._manhattan_distance(next_positions, state.goals)
             progress_reward_per_doer = (old_distances - new_distances) * self.progress_reward_scale
@@ -406,17 +412,29 @@ class TwoDoerBottleneckEnv:
                 self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
             )
             
-            arrived_this_step = jnp.logical_and(
-                jnp.all(next_positions == state.goals, axis=-1),
-                ~state.has_arrived
-            )
-            arrival_reward = (arrived_this_step.astype(jnp.float32) * self.arrival_reward).sum()
+            arrived_this_step = jnp.all(next_positions == state.goals, axis=-1)
             new_has_arrived = jnp.logical_or(state.has_arrived, arrived_this_step)
             
-            success = jnp.all(new_selected_correctly)
-            failed = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
+            team_just_arrived = jnp.logical_and(
+                jnp.all(new_has_arrived),
+                ~jnp.all(state.has_arrived)
+            )
+            arrival_reward = jnp.where(team_just_arrived, self.arrival_reward, jnp.asarray(0.0, dtype=jnp.float32))
             
-            task_reward = jnp.where(success, self.goal_reward, jnp.asarray(0.0, dtype=jnp.float32))
+            new_selected_option_idx = jnp.where(
+                valid_selection,
+                select_actions,
+                state.selected_option_idx
+            )
+
+            individual_selection_reward = (jnp.logical_and(valid_selection, is_correct).astype(jnp.float32) * self.individual_selection_reward).sum()
+
+            any_failure = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
+            all_success = jnp.all(new_selected_correctly)
+            
+            team_completion_reward = jnp.where(all_success, self.goal_reward, jnp.asarray(0.0, dtype=jnp.float32))
+            task_reward = team_completion_reward + individual_selection_reward
+
             reward = (
                 task_reward
                 + progress_reward
@@ -429,12 +447,13 @@ class TwoDoerBottleneckEnv:
                 positions=next_positions,
                 goals=state.goals,
                 step_count=state.step_count + 1,
-                done=jnp.logical_or(jnp.logical_or(success, failed), state.step_count + 1 >= self.max_steps),
+                done=jnp.logical_or(jnp.logical_or(any_failure, all_success), state.step_count + 1 >= self.max_steps),
                 target_items=state.target_items,
                 shuffled_menus=state.shuffled_menus,
                 selected_correctly=new_selected_correctly,
                 has_selected=new_has_selected,
                 has_arrived=new_has_arrived,
+                selected_option_idx=new_selected_option_idx,
             )
             info = {
                 "task_reward": task_reward,
@@ -487,7 +506,7 @@ class TwoDoerBottleneckEnv:
             goal_row, goal_col = np.asarray(state.goals[agent_idx]).tolist()
             y0 = goal_row * tile
             x0 = goal_col * tile
-            inset = max(tile // 4, 2)
+            inset = 2
             frame[
                 y0 + inset:(goal_row + 1) * tile - inset,
                 x0 + inset:(goal_col + 1) * tile - inset,
@@ -512,32 +531,25 @@ class TwoDoerBottleneckEnv:
         # Render Item Targets at goals
         bank = np.asarray(self.item_bank)
         for agent_idx in range(self.num_doers):
-            target_item = int(np.asarray(state.target_items)[agent_idx])
-            target_img = bank[target_item] # (5, 5, 3)
-            # scale 5x5 to inset region
-            goal_row, goal_col = np.asarray(state.goals[agent_idx]).tolist()
-            y0 = goal_row * tile
-            x0 = goal_col * tile
-            # upscale target_img to 15x15
-            target_upscaled = np.repeat(np.repeat(target_img, 3, axis=0), 3, axis=1)
             offset_y, offset_x = (tile - 15) // 2, (tile - 15) // 2
             
-            # Place target in center of goal
-            frame[
-                y0 + offset_y : y0 + offset_y + 15, 
-                x0 + offset_x : x0 + offset_x + 15
-            ] = target_upscaled
+            # Render menu options throughout the entire episode
+            menus = np.asarray(state.shuffled_menus[agent_idx])
+            has_sel = bool(np.asarray(state.has_selected[agent_idx]))
+            sel_idx = int(np.asarray(state.selected_option_idx[agent_idx]))
             
-            # Render menu options when goal is reached
-            if bool(np.asarray(state.positions[agent_idx] == state.goals[agent_idx]).all()):
-                menus = np.asarray(state.shuffled_menus[agent_idx])
-                for m_idx, option_id in enumerate(menus):
-                    opt_img = bank[option_id]
-                    opt_upscaled = np.repeat(np.repeat(opt_img, 3, axis=0), 3, axis=1)
-                    # draw menu below the grid or adjacent
-                    my0 = y0 - (m_idx + 1) * tile if agent_idx == 1 else y0 + (m_idx + 1) * tile
-                    # clip boundary
-                    my0 = max(0, min(my0, (self.grid_height - 1) * tile))
-                    frame[my0 + offset_y : my0 + offset_y + 15, x0 + offset_x : x0 + offset_x + 15] = opt_upscaled
+            for m_idx, option_id in enumerate(menus):
+                opt_img = bank[option_id]
+                opt_upscaled = np.repeat(np.repeat(opt_img, 3, axis=0), 3, axis=1)
+                
+                # Render left agent's menu on the right edge, and vice versa
+                my0 = (3 + m_idx) * tile
+                mx0 = (self.grid_width - 1) * tile if agent_idx == 0 else 0
+                
+                if has_sel and sel_idx == m_idx:
+                    # Draw a 2px colored ring around the chosen item outline
+                    frame[my0 + offset_y - 2 : my0 + offset_y + 17, mx0 + offset_x - 2 : mx0 + offset_x + 17] = np.asarray(self._agent_colors[agent_idx])
+                    
+                frame[my0 + offset_y : my0 + offset_y + 15, mx0 + offset_x : mx0 + offset_x + 15] = opt_upscaled
 
         return (frame * 255.0).astype(np.uint8)
