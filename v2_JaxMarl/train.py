@@ -70,6 +70,24 @@ def maybe_wandb_log(config, payload, **kwargs):
         wandb.log(payload, **kwargs)
 
 
+def save_training_checkpoint(params, checkpoint_step, label="final"):
+    from flax.training import checkpoints
+
+    checkpoint_dir = Path(__file__).resolve().parent / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = checkpoints.save_checkpoint(
+        ckpt_dir=str(checkpoint_dir),
+        target=params,
+        step=int(checkpoint_step),
+        overwrite=True,
+    )
+    print(
+        f"Saved {label} checkpoint to {saved_path} "
+        f"(dir={checkpoint_dir}, step={int(checkpoint_step)})"
+    )
+    return Path(saved_path)
+
+
 def reset_curriculum_batch(
     env,
     rng,
@@ -1750,6 +1768,7 @@ def probe_and_save_codebook(env, params, rng, doer, fsq_levels, checkpoint_step)
     print("\n" + "="*72)
     print("PROBING CODEBOOK AT END OF TRAINING")
     print("="*72)
+    save_training_checkpoint(params, checkpoint_step, label="final")
     
     ranges = [list(range(l)) for l in fsq_levels]
     words = list(itertools.product(*ranges))
@@ -1786,20 +1805,6 @@ def probe_and_save_codebook(env, params, rng, doer, fsq_levels, checkpoint_step)
         
     with open("final_codebook.json", "w") as f:
         json.dump(codebook_mapping, f, indent=4)
-        
-    try:
-        from flax.training import checkpoints
-        import os
-        os.makedirs("checkpoints", exist_ok=True)
-        checkpoints.save_checkpoint(
-            ckpt_dir="checkpoints/",
-            target=params,
-            step=int(checkpoint_step),
-            overwrite=True,
-        )
-        print(f"Saved final model weights to checkpoints/ at step {int(checkpoint_step)}")
-    except ImportError:
-        pass
     print("Codebook saved to final_codebook.json")
 
 if __name__ == "__main__":
