@@ -280,7 +280,7 @@ def build_summary(messages, navigation_results, selection_results):
 
 def main():
     args = parse_args()
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = Path(args.checkpoint).resolve()
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
