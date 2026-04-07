@@ -16,6 +16,7 @@ class TwoDoerState:
     shuffled_menus: jnp.ndarray
     selected_correctly: jnp.ndarray
     has_selected: jnp.ndarray
+    has_arrived: jnp.ndarray
 
 
 class TwoDoerBottleneckEnv:
@@ -30,6 +31,7 @@ class TwoDoerBottleneckEnv:
         max_steps: int = 48,
         progress_reward_scale: float = 0.05,
         goal_reward: float = 1.0,
+        arrival_reward: float = 0.5,
         step_penalty: float = 0.03,
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
@@ -54,6 +56,7 @@ class TwoDoerBottleneckEnv:
         self.max_steps = int(max_steps)
         self.progress_reward_scale = jnp.asarray(progress_reward_scale, dtype=jnp.float32)
         self.goal_reward = jnp.asarray(goal_reward, dtype=jnp.float32)
+        self.arrival_reward = jnp.asarray(arrival_reward, dtype=jnp.float32)
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
@@ -302,6 +305,7 @@ class TwoDoerBottleneckEnv:
             shuffled_menus=jnp.stack([menu_a, menu_b]),
             selected_correctly=jnp.array([False, False]),
             has_selected=jnp.array([False, False]),
+            has_arrived=jnp.array([False, False]),
         )
         return self._split_observations(state), state
 
@@ -402,6 +406,13 @@ class TwoDoerBottleneckEnv:
                 self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
             )
             
+            arrived_this_step = jnp.logical_and(
+                jnp.all(next_positions == state.goals, axis=-1),
+                ~state.has_arrived
+            )
+            arrival_reward = (arrived_this_step.astype(jnp.float32) * self.arrival_reward).sum()
+            new_has_arrived = jnp.logical_or(state.has_arrived, arrived_this_step)
+            
             success = jnp.all(new_selected_correctly)
             failed = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
             
@@ -409,6 +420,7 @@ class TwoDoerBottleneckEnv:
             reward = (
                 task_reward
                 + progress_reward
+                + arrival_reward
                 - self.step_penalty
                 - wall_penalty
                 - collision_penalty
@@ -422,6 +434,7 @@ class TwoDoerBottleneckEnv:
                 shuffled_menus=state.shuffled_menus,
                 selected_correctly=new_selected_correctly,
                 has_selected=new_has_selected,
+                has_arrived=new_has_arrived,
             )
             info = {
                 "task_reward": task_reward,
