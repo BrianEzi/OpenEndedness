@@ -363,6 +363,7 @@ def make_two_doer_rollout_step(
             doer_logits,
             env_obs["menu_images"],
             pick_only_phase=env.is_pick_object_phase,
+            pick_available=env_obs["pick_available"],
         )
         doer_pi = distrax.Categorical(logits=doer_logits)
         doer_action = doer_pi.sample(seed=action_rng)
@@ -393,6 +394,7 @@ def make_two_doer_rollout_step(
             message=discrete_messages,
             target_images=env_obs["target_images"],
             menu_images=env_obs["menu_images"],
+            pick_available=env_obs["pick_available"],
             doer_action=doer_action,
             doer_log_prob=doer_log_prob,
             value=value,

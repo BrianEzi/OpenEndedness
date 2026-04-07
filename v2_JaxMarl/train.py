@@ -527,6 +527,7 @@ def _run_two_doer_greedy_episode(
             flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
             menu_images,
             pick_only_phase=env.is_pick_object_phase,
+            pick_available=obs["pick_available"][None, ...],
         )
         actions = jnp.argmax(
             masked_logits[0],
@@ -743,7 +744,8 @@ def print_two_doer_selection_level_banner(level, env, label="TWO-DOER SELECTION 
     if int(level) == 1:
         description = (
             "Pick_Object: doers are frozen at goal tiles, only object picks are allowed, "
-            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}"
+            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}, "
+            f"pick_object_listen_steps={env.pick_object_listen_steps}"
         )
     else:
         description = (
@@ -852,6 +854,7 @@ def visualize_two_doer_episode(
             flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
             menu_images,
             pick_only_phase=env.is_pick_object_phase,
+            pick_available=obs["pick_available"][None, ...],
         )
         actions = jnp.argmax(
             masked_logits[0],
@@ -921,6 +924,11 @@ def visualize_two_doer_episode(
 def run_two_doer_training(config):
     rng = jax.random.PRNGKey(config["seed"])
     rng, seer_init_rng, doer_init_rng, critic_init_rng, reset_rng = jax.random.split(rng, 5)
+    initial_selection_phase_level = (
+        config["two_doer_selection_level_start"]
+        if config["use_pick_object_curriculum"]
+        else 2
+    )
 
     env = TwoDoerBottleneckEnv(
         grid_height=config["grid_height"],
@@ -936,9 +944,10 @@ def run_two_doer_training(config):
         wall_penalty=config["wall_penalty"],
         collision_penalty=config["collision_penalty"],
         doer_perception_level=config["doer_perception_level"],
-        selection_phase_level=config["two_doer_selection_level_start"],
+        selection_phase_level=initial_selection_phase_level,
         max_selection_attempts=config["two_doer_max_selection_attempts"],
         pick_object_max_steps=config["pick_object_max_steps"],
+        pick_object_listen_steps=config["pick_object_listen_steps"],
     )
     curriculum_active = (
         config["use_two_doer_start_curriculum"]
@@ -1192,6 +1201,8 @@ def run_two_doer_training(config):
             )
 
         if (
+            config["use_pick_object_curriculum"]
+            and
             env.selection_phase_level == 1
             and float(first_try_success_rate) > config["two_doer_selection_level_advance_threshold"]
         ):
@@ -1390,10 +1401,12 @@ def main():
         "cic_coef": 0.01,
         "seer_entropy_coef": 0.05,
         "doer_perception_level": 2,
+        "use_pick_object_curriculum": True,
         "two_doer_selection_level_start": 1,
         "two_doer_selection_level_advance_threshold": 0.90,
         "two_doer_max_selection_attempts": 4,
         "pick_object_max_steps": 8,
+        "pick_object_listen_steps": 1,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,

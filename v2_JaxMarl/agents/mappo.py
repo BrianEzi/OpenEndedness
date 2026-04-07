@@ -48,6 +48,7 @@ class TwoDoerTransition:
     message: chex.Array
     target_images: chex.Array
     menu_images: chex.Array
+    pick_available: chex.Array
     doer_action: chex.Array
     doer_log_prob: chex.Array
     value: chex.Array
@@ -302,6 +303,7 @@ def calculate_two_doer_actor_losses(
             doer_logits,
             transition_step.menu_images,
             pick_only_phase=pick_only_phase,
+            pick_available=transition_step.pick_available,
         )
         return (next_seer_carry, next_doer_carry), (doer_logits, discrete_messages)
 

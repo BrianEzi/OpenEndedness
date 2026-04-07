@@ -46,6 +46,7 @@ class TwoDoerBottleneckEnv:
         render_tile_size: int = 24,
         max_selection_attempts: int = 4,
         pick_object_max_steps: int = 8,
+        pick_object_listen_steps: int = 1,
     ):
         if grid_height < 8:
             raise ValueError("grid_height must be >= 8.")
@@ -80,6 +81,7 @@ class TwoDoerBottleneckEnv:
         self.doer_perception_level = int(doer_perception_level)
         self._max_selection_attempts = int(max_selection_attempts)
         self.pick_object_max_steps = int(pick_object_max_steps)
+        self.pick_object_listen_steps = int(pick_object_listen_steps)
         self.selection_phase_level = 1
         self.set_selection_phase_level(selection_phase_level)
         self.render_tile_size = int(render_tile_size)
@@ -288,6 +290,13 @@ class TwoDoerBottleneckEnv:
         target_images = self.item_bank[state.target_items]
         menu_images = self.item_bank[state.shuffled_menus]
         menu_images = jnp.where(goals_reached[:, None, None, None, None], menu_images, 0.0)
+        pick_available = jnp.logical_and(
+            goals_reached.astype(bool),
+            jnp.logical_or(
+                jnp.asarray(not self.is_pick_object_phase),
+                state.step_count >= self.pick_object_listen_steps,
+            ),
+        )
 
         return {
             "global_map": global_map,
@@ -296,6 +305,7 @@ class TwoDoerBottleneckEnv:
             "proprioceptions": proprioceptions,
             "target_images": target_images,
             "menu_images": menu_images,
+            "pick_available": pick_available,
         }
 
     def _goals_from_positions(self, positions: jnp.ndarray) -> jnp.ndarray:
@@ -452,8 +462,13 @@ class TwoDoerBottleneckEnv:
             select_actions = actions - 5
             is_selecting = actions >= 5
             at_goal = jnp.all(state.positions == state.goals, axis=-1)
+            pick_available = jnp.logical_or(
+                ~self.is_pick_object_phase,
+                state.step_count >= self.pick_object_listen_steps,
+            )
 
             valid_selection = jnp.logical_and(is_selecting, at_goal)
+            valid_selection = jnp.logical_and(valid_selection, pick_available)
             valid_selection = jnp.logical_and(valid_selection, ~state.has_selected)
 
             chosen_item = jnp.take_along_axis(state.shuffled_menus, select_actions[:, None], axis=1)[:, 0]
@@ -549,7 +564,11 @@ class TwoDoerBottleneckEnv:
                 task_reward
                 + progress_reward
                 + arrival_reward
-                - self.step_penalty
+                - jnp.where(
+                    jnp.logical_and(self.is_pick_object_phase, state.step_count < self.pick_object_listen_steps),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    self.step_penalty,
+                )
                 - wrong_selection_penalty
                 - wall_penalty
                 - collision_penalty
@@ -575,7 +594,11 @@ class TwoDoerBottleneckEnv:
                 "valid_selection_count": valid_selection_count,
                 "correct_selection_count": correct_selection_count,
                 "progress_reward_per_doer": progress_reward_per_doer,
-                "step_penalty": self.step_penalty,
+                "step_penalty": jnp.where(
+                    jnp.logical_and(self.is_pick_object_phase, state.step_count < self.pick_object_listen_steps),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    self.step_penalty,
+                ),
                 "wall_penalty": wall_penalty,
                 "collision_penalty": collision_penalty,
                 "goal_distance": new_distances,
