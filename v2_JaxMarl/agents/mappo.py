@@ -51,6 +51,7 @@ class TwoDoerTransition:
     value: chex.Array
     reward: chex.Array
     task_reward: chex.Array
+    individual_selection_reward: chex.Array
     progress_reward_per_doer: chex.Array
     step_penalty_component: chex.Array
     wall_penalty_component: chex.Array

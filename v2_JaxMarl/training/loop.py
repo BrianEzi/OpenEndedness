@@ -387,6 +387,7 @@ def make_two_doer_rollout_step(
             value=value,
             reward=reward,
             task_reward=info["task_reward"],
+            individual_selection_reward=info["individual_selection_reward"],
             progress_reward_per_doer=info["progress_reward_per_doer"],
             step_penalty_component=info["step_penalty"],
             wall_penalty_component=info["wall_penalty"],

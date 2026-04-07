@@ -31,7 +31,7 @@ try:
     import wandb
 except ImportError:
     wandb = None
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 # For the sake of a complete script, here is a pragmatic, standard Critic
@@ -311,6 +311,92 @@ def initialize_two_doer_carry(doer, num_envs, num_doers, hidden_size):
     )
 
 
+def format_two_doer_action(action: int) -> str:
+    action_labels = (
+        "stay",
+        "up",
+        "right",
+        "down",
+        "left",
+        "pick_0",
+        "pick_1",
+        "pick_2",
+        "pick_3",
+    )
+    return action_labels[action] if 0 <= action < len(action_labels) else str(action)
+
+
+def format_message_vector(message_values) -> str:
+    values = np.asarray(message_values, dtype=np.float32).reshape(-1)
+    return "[" + ", ".join(f"{float(v):.2f}" for v in values) + "]"
+
+
+def build_two_doer_trace_snapshot(step_count, state, messages, actions):
+    positions = np.asarray(state.positions).tolist()
+    message_np = np.asarray(messages[0], dtype=np.float32)
+    action_list = [int(action) for action in np.asarray(actions).tolist()]
+    action_names = [format_two_doer_action(action) for action in action_list]
+    left_text = "\n".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_a={positions[0]}",
+            f"msg_a={format_message_vector(message_np[0])}",
+            f"act_a={action_names[0]}",
+        ]
+    )
+    right_text = "\n".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_b={positions[1]}",
+            f"msg_b={format_message_vector(message_np[1])}",
+            f"act_b={action_names[1]}",
+        ]
+    )
+    trace_line = " ".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_a={positions[0]}",
+            f"pos_b={positions[1]}",
+            f"msg_a={format_message_vector(message_np[0])}",
+            f"act_a={action_names[0]}",
+            f"msg_b={format_message_vector(message_np[1])}",
+            f"act_b={action_names[1]}",
+        ]
+    )
+    return trace_line, left_text, right_text
+
+
+def annotate_two_doer_frame(frame, left_text, right_text):
+    panel_width = 240
+    background = (246, 244, 238)
+    border = (190, 186, 176)
+    text_color = (25, 25, 28)
+    font = ImageFont.load_default()
+    grid_image = Image.fromarray(frame)
+    canvas = Image.new(
+        "RGB",
+        (grid_image.width + 2 * panel_width, grid_image.height),
+        background,
+    )
+    canvas.paste(grid_image, (panel_width, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, panel_width - 1, grid_image.height - 1), outline=border, width=1)
+    draw.rectangle(
+        (panel_width + grid_image.width, 0, canvas.width - 1, grid_image.height - 1),
+        outline=border,
+        width=1,
+    )
+    draw.multiline_text((12, 12), left_text, fill=text_color, font=font, spacing=4)
+    draw.multiline_text(
+        (panel_width + grid_image.width + 12, 12),
+        right_text,
+        fill=text_color,
+        font=font,
+        spacing=4,
+    )
+    return canvas
+
+
 def reset_two_doer_batch(env, rng, num_envs, fixed_positions):
     rng, env_rng = jax.random.split(rng)
     reset_keys = jax.random.split(env_rng, num_envs)
@@ -342,7 +428,6 @@ def _run_two_doer_greedy_episode(
     fixed_positions=UNSET_TWO_DOER_POSITIONS,
     capture_trace=False,
 ):
-    action_labels = ("stay", "up", "right", "down", "left")
     rng, reset_rng = jax.random.split(rng)
     obs, state = env.reset(reset_rng, fixed_positions=fixed_positions)
 
@@ -398,25 +483,13 @@ def _run_two_doer_greedy_episode(
         ).astype(jnp.int32)
 
         if capture_trace:
-            positions = np.asarray(state.positions).tolist()
-            message_np = np.asarray(messages[0]).round(3).tolist()
-            action_names = [
-                action_labels[int(action)] if int(action) < len(action_labels) else str(int(action))
-                for action in np.asarray(actions).tolist()
-            ]
-            trace_lines.append(
-                " ".join(
-                    [
-                        f"t={step_count:02d}",
-                        f"pos_a={positions[0]}",
-                        f"pos_b={positions[1]}",
-                        f"msg_a={message_np[0]}",
-                        f"act_a={action_names[0]}",
-                        f"msg_b={message_np[1]}",
-                        f"act_b={action_names[1]}",
-                    ]
-                )
+            trace_line, _, _ = build_two_doer_trace_snapshot(
+                step_count,
+                state,
+                messages,
+                actions,
             )
+            trace_lines.append(trace_line)
 
         rng, step_rng = jax.random.split(rng)
         obs, state, _, done, info = env.step(
@@ -669,11 +742,9 @@ def visualize_two_doer_episode(
     step_count = 0
     success = False
     frames = []
+    trace_lines = []
 
     while not bool(done) and step_count < config["episode_max_steps"]:
-        frame = env.render(state)
-        frames.append(Image.fromarray(frame))
-
         global_map = obs["global_map"][None, ...]
         symbolic_state = obs["symbolic_state"][None, ...]
         local_views = obs["local_views"][None, ...]
@@ -716,6 +787,15 @@ def visualize_two_doer_episode(
             flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))[0],
             axis=-1,
         ).astype(jnp.int32)
+        trace_line, left_text, right_text = build_two_doer_trace_snapshot(
+            step_count,
+            state,
+            messages,
+            actions,
+        )
+        frame = env.render(state)
+        frames.append(annotate_two_doer_frame(frame, left_text, right_text))
+        trace_lines.append(trace_line)
 
         rng, step_rng = jax.random.split(rng)
         obs, state, _, done, info = env.step(
@@ -726,6 +806,9 @@ def visualize_two_doer_episode(
         )
         success = success or bool(info["success"])
         step_count += 1
+
+    final_status = "solved" if success else "stopped"
+    trace_lines.append(f"end={final_status} steps={step_count}")
 
     if frames:
         frames[0].save(
@@ -746,8 +829,11 @@ def visualize_two_doer_episode(
                 commit=True,
             )
         print(f"Two-doer eval episode saved to {output_path}")
+        print(f"Two-doer communication trace (visualize_{update}):")
+        for line in trace_lines:
+            print(line)
 
-    return rng, output_path, success
+    return rng, output_path, success, trace_lines
 
 
 def run_two_doer_training(config):
@@ -945,6 +1031,7 @@ def run_two_doer_training(config):
                         "rollout_success_rate": rollout_success_rate,
                         "team_reward": trajectory_batch.reward.mean(),
                         "task_reward": trajectory_batch.task_reward.mean(),
+                        "individual_selection_reward": trajectory_batch.individual_selection_reward.mean(),
                         "progress_reward_doer_a": trajectory_batch.progress_reward_per_doer[..., 0].mean(),
                         "progress_reward_doer_b": trajectory_batch.progress_reward_per_doer[..., 1].mean(),
                         "step_penalty": trajectory_batch.step_penalty_component.mean(),
@@ -971,6 +1058,7 @@ def run_two_doer_training(config):
                 f"SuccessRate: {float(rollout_success_rate):.3f} | "
                 f"TeamReward: {trajectory_batch.reward.mean():.3f} | "
                 f"Task: {trajectory_batch.task_reward.mean():.3f} | "
+                f"IndSel: {trajectory_batch.individual_selection_reward.mean():.3f} | "
                 f"ProgA: {trajectory_batch.progress_reward_per_doer[..., 0].mean():.3f} | "
                 f"ProgB: {trajectory_batch.progress_reward_per_doer[..., 1].mean():.3f} | "
                 f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
@@ -1105,7 +1193,7 @@ def run_two_doer_training(config):
                     current_start_success_streak = 0
 
         if update > 0 and update % config["visualize_every"] == 0:
-            rng, _, _ = visualize_two_doer_episode(
+            rng, _, viz_success, _ = visualize_two_doer_episode(
                 env,
                 params,
                 rng,
@@ -1115,6 +1203,30 @@ def run_two_doer_training(config):
                 update,
                 fixed_positions=fixed_positions,
             )
+            if float(rollout_success_rate) >= 1.0:
+                global_step = int((update + 1) * config["num_steps"] * config["num_envs"])
+                print("")
+                print("=" * 72)
+                print(
+                    "SUCCESSFUL: rollout_success_rate reached 1.000 after visualization "
+                    f"at global_step={global_step}"
+                )
+                print("=" * 72)
+                print("")
+                if not viz_success:
+                    print(
+                        "Visualization episode did not solve despite rollout_success_rate=1.000; "
+                        "continuing with checkpoint save and termination."
+                    )
+                probe_and_save_codebook(
+                    env,
+                    params,
+                    rng,
+                    doer,
+                    config["fsq_levels"],
+                    checkpoint_step=global_step,
+                )
+                return
 
 
 def main():
@@ -1133,7 +1245,7 @@ def main():
         "local_view_size": 3,
         "corridor_length": 3,
         "episode_max_steps": 48,
-        "goal_reward": 1.0,
+        "goal_reward": 2.0,
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.1,
         "wrong_selection_penalty": 0.15,
@@ -1622,9 +1734,16 @@ def main():
                     )
 
     # END OF TRAINING
-    probe_and_save_codebook(env, params, rng, doer, config["fsq_levels"])
+    probe_and_save_codebook(
+        env,
+        params,
+        rng,
+        doer,
+        config["fsq_levels"],
+        checkpoint_step=config["total_timesteps"],
+    )
 
-def probe_and_save_codebook(env, params, rng, doer, fsq_levels):
+def probe_and_save_codebook(env, params, rng, doer, fsq_levels, checkpoint_step):
     import itertools
     import json
     
@@ -1672,8 +1791,13 @@ def probe_and_save_codebook(env, params, rng, doer, fsq_levels):
         from flax.training import checkpoints
         import os
         os.makedirs("checkpoints", exist_ok=True)
-        checkpoints.save_checkpoint(ckpt_dir="checkpoints/", target=params, step=1000, overwrite=True)
-        print("Saved final model weights to checkpoints/")
+        checkpoints.save_checkpoint(
+            ckpt_dir="checkpoints/",
+            target=params,
+            step=int(checkpoint_step),
+            overwrite=True,
+        )
+        print(f"Saved final model weights to checkpoints/ at step {int(checkpoint_step)}")
     except ImportError:
         pass
     print("Codebook saved to final_codebook.json")
