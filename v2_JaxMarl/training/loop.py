@@ -4,6 +4,7 @@ import distrax
 from typing import Tuple, Any, Dict
 from training.gae import compute_gae 
 from training.action_masking import mask_pick_actions_until_menu_visible
+from training.message_masking import hard_mask_inactive_message_bits
 
 # Assuming Transition is imported from your mappo.py or a shared datatypes file
 from agents.mappo import Transition, TwoDoerTransition
@@ -328,6 +329,10 @@ def make_two_doer_rollout_step(
             symbolic_obs,
             env_obs["target_images"]
         )
+        discrete_messages = hard_mask_inactive_message_bits(
+            discrete_messages,
+            active_bits=env.active_message_bits,
+        )
 
         batch_size, num_doers = local_obs.shape[:2]
         flat_local_obs = local_obs.reshape((batch_size * num_doers,) + local_obs.shape[2:])
@@ -354,7 +359,11 @@ def make_two_doer_rollout_step(
             next_flat_doer_carry,
         )
         doer_logits = flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1]))
-        doer_logits = mask_pick_actions_until_menu_visible(doer_logits, env_obs["menu_images"])
+        doer_logits = mask_pick_actions_until_menu_visible(
+            doer_logits,
+            env_obs["menu_images"],
+            pick_only_phase=env.is_pick_object_phase,
+        )
         doer_pi = distrax.Categorical(logits=doer_logits)
         doer_action = doer_pi.sample(seed=action_rng)
         doer_log_prob = doer_pi.log_prob(doer_action)
@@ -392,6 +401,8 @@ def make_two_doer_rollout_step(
             individual_selection_reward=info["individual_selection_reward"],
             valid_selection_count=info["valid_selection_count"],
             correct_selection_count=info["correct_selection_count"],
+            eventual_success=info["eventual_success"],
+            first_try_success=info["first_try_success"],
             progress_reward_per_doer=info["progress_reward_per_doer"],
             step_penalty_component=info["step_penalty"],
             wall_penalty_component=info["wall_penalty"],

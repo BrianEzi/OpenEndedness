@@ -15,6 +15,7 @@ class TwoDoerState:
     target_items: jnp.ndarray
     shuffled_menus: jnp.ndarray
     selected_correctly: jnp.ndarray
+    first_selection_correct: jnp.ndarray
     has_selected: jnp.ndarray
     has_arrived: jnp.ndarray
     selection_attempts: jnp.ndarray
@@ -36,12 +37,15 @@ class TwoDoerBottleneckEnv:
         arrival_reward: float = 0.5,
         individual_selection_reward: float = 0.5,
         wrong_selection_penalty: float = 0.15,
+        wrong_selection_penalty_after_first: float | None = None,
         step_penalty: float = 0.03,
         wall_penalty: float = 0.02,
         collision_penalty: float = 0.05,
         doer_perception_level: int = 2,
         selection_phase_level: int = 1,
         render_tile_size: int = 24,
+        max_selection_attempts: int = 4,
+        pick_object_max_steps: int = 8,
     ):
         if grid_height < 8:
             raise ValueError("grid_height must be >= 8.")
@@ -64,10 +68,18 @@ class TwoDoerBottleneckEnv:
         self.arrival_reward = jnp.asarray(arrival_reward, dtype=jnp.float32)
         self.individual_selection_reward = jnp.asarray(individual_selection_reward, dtype=jnp.float32)
         self.wrong_selection_penalty = jnp.asarray(wrong_selection_penalty, dtype=jnp.float32)
+        if wrong_selection_penalty_after_first is None:
+            wrong_selection_penalty_after_first = wrong_selection_penalty * 2.0
+        self.wrong_selection_penalty_after_first = jnp.asarray(
+            wrong_selection_penalty_after_first,
+            dtype=jnp.float32,
+        )
         self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
         self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
         self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
         self.doer_perception_level = int(doer_perception_level)
+        self._max_selection_attempts = int(max_selection_attempts)
+        self.pick_object_max_steps = int(pick_object_max_steps)
         self.selection_phase_level = 1
         self.set_selection_phase_level(selection_phase_level)
         self.render_tile_size = int(render_tile_size)
@@ -107,7 +119,23 @@ class TwoDoerBottleneckEnv:
 
     @property
     def max_selection_attempts(self) -> int:
-        return 2 if self.selection_phase_level == 1 else 1
+        return self._max_selection_attempts
+
+    @property
+    def phase_name(self) -> str:
+        return "Pick_Object" if self.selection_phase_level == 1 else "Full_Training"
+
+    @property
+    def active_message_bits(self) -> int:
+        return 3 if self.selection_phase_level == 1 else 4
+
+    @property
+    def is_pick_object_phase(self) -> bool:
+        return self.selection_phase_level == 1
+
+    @property
+    def phase_max_steps(self) -> int:
+        return self.pick_object_max_steps if self.is_pick_object_phase else self.max_steps
 
     def set_selection_phase_level(self, level: int) -> None:
         level = int(level)
@@ -294,12 +322,22 @@ class TwoDoerBottleneckEnv:
             ],
             dtype=jnp.int32,
         )
-        positions = jnp.where(
+        start_positions = jnp.where(
             jnp.all(fixed_positions >= 0),
             fixed_positions.astype(jnp.int32),
             sampled_positions,
         )
-        goals = self._goals_from_positions(positions)
+        phase_goals = self._goals_from_positions(start_positions)
+        positions = jnp.where(
+            self.is_pick_object_phase,
+            phase_goals,
+            start_positions,
+        )
+        goals = jnp.where(
+            self.is_pick_object_phase,
+            positions,
+            phase_goals,
+        )
         
         key_target_a, key_target_b, key_menu_a, key_menu_b = jax.random.split(key, 4)
         target_a = jax.random.randint(key_target_a, (), 0, 16)
@@ -323,6 +361,7 @@ class TwoDoerBottleneckEnv:
             target_items=jnp.array([target_a, target_b]),
             shuffled_menus=jnp.stack([menu_a, menu_b]),
             selected_correctly=jnp.array([False, False]),
+            first_selection_correct=jnp.array([False, False]),
             has_selected=jnp.array([False, False]),
             has_arrived=jnp.array([False, False]),
             selection_attempts=jnp.zeros((self.num_doers,), dtype=jnp.int32),
@@ -400,12 +439,15 @@ class TwoDoerBottleneckEnv:
                 "collision_penalty": zeros,
                 "goal_distance": self._manhattan_distance(reset_state.positions, reset_state.goals),
                 "success": jnp.asarray(False),
+                "eventual_success": jnp.asarray(False),
+                "first_try_success": jnp.asarray(False),
                 "failed": jnp.asarray(False),
             }
             return reset_obs, reset_state, zeros, jnp.asarray(False), info
 
         def step_branch(_):
             max_selection_attempts = self.max_selection_attempts
+            phase_max_steps = self.phase_max_steps
             nav_actions = jnp.where(actions < 5, actions, 0)
             select_actions = actions - 5
             is_selecting = actions >= 5
@@ -421,35 +463,53 @@ class TwoDoerBottleneckEnv:
             correct_selection = jnp.logical_and(valid_selection, is_correct)
             wrong_selection = jnp.logical_and(valid_selection, ~is_correct)
             new_selected_correctly = jnp.logical_or(state.selected_correctly, correct_selection)
+            new_first_selection_correct = jnp.logical_or(
+                state.first_selection_correct,
+                jnp.logical_and(correct_selection, new_selection_attempts == 1),
+            )
             attempts_exhausted = new_selection_attempts >= max_selection_attempts
             new_has_selected = jnp.logical_or(
                 state.has_selected,
                 jnp.logical_or(new_selected_correctly, attempts_exhausted),
             )
-            
-            old_distances = self._manhattan_distance(state.positions, state.goals)
-            next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
-            
-            # Lock position if selecting on this step or if already selected previously
-            is_locked = jnp.logical_or(is_selecting, state.has_selected)
-            next_positions = jnp.where(is_locked[:, None], state.positions, next_positions)
-            
-            new_distances = self._manhattan_distance(next_positions, state.goals)
-            progress_reward_per_doer = (old_distances - new_distances) * self.progress_reward_scale
-            progress_reward = progress_reward_per_doer.sum()
-            wall_penalty = self.wall_penalty * wall_hits.astype(jnp.float32).sum()
-            collision_penalty = (
-                self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
-            )
-            
-            arrived_this_step = jnp.all(next_positions == state.goals, axis=-1)
-            new_has_arrived = jnp.logical_or(state.has_arrived, arrived_this_step)
-            
-            team_just_arrived = jnp.logical_and(
-                jnp.all(new_has_arrived),
-                ~jnp.all(state.has_arrived)
-            )
-            arrival_reward = jnp.where(team_just_arrived, self.arrival_reward, jnp.asarray(0.0, dtype=jnp.float32))
+
+            if self.is_pick_object_phase:
+                next_positions = state.positions
+                new_distances = self._manhattan_distance(next_positions, state.goals)
+                progress_reward_per_doer = jnp.zeros((self.num_doers,), dtype=jnp.float32)
+                progress_reward = jnp.asarray(0.0, dtype=jnp.float32)
+                wall_penalty = jnp.asarray(0.0, dtype=jnp.float32)
+                collision_penalty = jnp.asarray(0.0, dtype=jnp.float32)
+                new_has_arrived = jnp.ones((self.num_doers,), dtype=bool)
+                arrival_reward = jnp.asarray(0.0, dtype=jnp.float32)
+            else:
+                old_distances = self._manhattan_distance(state.positions, state.goals)
+                next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
+
+                # Lock position if selecting on this step or if already selected previously
+                is_locked = jnp.logical_or(is_selecting, state.has_selected)
+                next_positions = jnp.where(is_locked[:, None], state.positions, next_positions)
+
+                new_distances = self._manhattan_distance(next_positions, state.goals)
+                progress_reward_per_doer = (old_distances - new_distances) * self.progress_reward_scale
+                progress_reward = progress_reward_per_doer.sum()
+                wall_penalty = self.wall_penalty * wall_hits.astype(jnp.float32).sum()
+                collision_penalty = (
+                    self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
+                )
+
+                arrived_this_step = jnp.all(next_positions == state.goals, axis=-1)
+                new_has_arrived = jnp.logical_or(state.has_arrived, arrived_this_step)
+
+                team_just_arrived = jnp.logical_and(
+                    jnp.all(new_has_arrived),
+                    ~jnp.all(state.has_arrived)
+                )
+                arrival_reward = jnp.where(
+                    team_just_arrived,
+                    self.arrival_reward,
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
             
             new_selected_option_idx = jnp.where(
                 valid_selection,
@@ -460,14 +520,23 @@ class TwoDoerBottleneckEnv:
             individual_selection_reward = (
                 correct_selection.astype(jnp.float32) * self.individual_selection_reward
             ).sum()
+            wrong_penalty_per_doer = jnp.where(
+                new_selection_attempts <= 1,
+                self.wrong_selection_penalty,
+                self.wrong_selection_penalty_after_first,
+            )
             wrong_selection_penalty = (
-                wrong_selection.astype(jnp.float32) * self.wrong_selection_penalty
+                wrong_selection.astype(jnp.float32) * wrong_penalty_per_doer
             ).sum()
             valid_selection_count = valid_selection.astype(jnp.float32).sum()
             correct_selection_count = correct_selection.astype(jnp.float32).sum()
 
-            any_failure = jnp.any(jnp.logical_and(new_has_selected, ~new_selected_correctly))
             all_success = jnp.all(new_selected_correctly)
+            all_terminal = jnp.all(new_has_selected)
+            first_try_success = jnp.logical_and(
+                all_success,
+                jnp.all(new_first_selection_correct),
+            )
             
             team_completion_reward = jnp.where(
                 all_success,
@@ -489,10 +558,11 @@ class TwoDoerBottleneckEnv:
                 positions=next_positions,
                 goals=state.goals,
                 step_count=state.step_count + 1,
-                done=jnp.logical_or(jnp.logical_or(any_failure, all_success), state.step_count + 1 >= self.max_steps),
+                done=jnp.logical_or(all_terminal, state.step_count + 1 >= phase_max_steps),
                 target_items=state.target_items,
                 shuffled_menus=state.shuffled_menus,
                 selected_correctly=new_selected_correctly,
+                first_selection_correct=new_first_selection_correct,
                 has_selected=new_has_selected,
                 has_arrived=new_has_arrived,
                 selection_attempts=new_selection_attempts,
@@ -510,7 +580,9 @@ class TwoDoerBottleneckEnv:
                 "collision_penalty": collision_penalty,
                 "goal_distance": new_distances,
                 "success": all_success,
-                "failed": any_failure,
+                "eventual_success": all_success,
+                "first_try_success": first_try_success,
+                "failed": jnp.logical_and(next_state.done, ~all_success),
             }
             return self._split_observations(next_state), next_state, reward, next_state.done, info
 
@@ -575,12 +647,23 @@ class TwoDoerBottleneckEnv:
             tile_view[triangle_mask] = np.asarray(self._agent_colors[agent_idx])
             frame[y0:(row + 1) * tile, x0:(col + 1) * tile] = tile_view
 
-        # Render Item Targets at goals
+        target_ring = np.array([0.95, 0.75, 0.10], dtype=np.float32)
+        correct_ring = np.array([0.18, 0.72, 0.28], dtype=np.float32)
+        wrong_ring = np.array([0.88, 0.22, 0.22], dtype=np.float32)
+
+        # Render target and menu options on the outer columns.
         bank = np.asarray(self.item_bank)
         for agent_idx in range(self.num_doers):
             offset_y, offset_x = (tile - 15) // 2, (tile - 15) // 2
-            
-            # Render menu options throughout the entire episode
+
+            side_col = (self.grid_width - 1) * tile if agent_idx == 0 else 0
+            target_id = int(np.asarray(state.target_items[agent_idx]))
+            target_img = bank[target_id]
+            target_upscaled = np.repeat(np.repeat(target_img, 3, axis=0), 3, axis=1)
+            target_y0 = tile
+            frame[target_y0 + offset_y - 2: target_y0 + offset_y + 17, side_col + offset_x - 2: side_col + offset_x + 17] = target_ring
+            frame[target_y0 + offset_y: target_y0 + offset_y + 15, side_col + offset_x: side_col + offset_x + 15] = target_upscaled
+
             menus = np.asarray(state.shuffled_menus[agent_idx])
             has_sel = bool(np.asarray(state.selection_attempts[agent_idx] > 0))
             sel_idx = int(np.asarray(state.selected_option_idx[agent_idx]))
@@ -588,15 +671,22 @@ class TwoDoerBottleneckEnv:
             for m_idx, option_id in enumerate(menus):
                 opt_img = bank[option_id]
                 opt_upscaled = np.repeat(np.repeat(opt_img, 3, axis=0), 3, axis=1)
-                
-                # Render left agent's menu on the right edge, and vice versa
+
                 my0 = (3 + m_idx) * tile
-                mx0 = (self.grid_width - 1) * tile if agent_idx == 0 else 0
-                
+                mx0 = side_col
+
+                if int(option_id) == target_id:
+                    frame[
+                        my0 + offset_y - 1: my0 + offset_y + 16,
+                        mx0 + offset_x - 1: mx0 + offset_x + 16,
+                    ] = target_ring
                 if has_sel and sel_idx == m_idx:
-                    # Draw a 2px colored ring around the chosen item outline
-                    frame[my0 + offset_y - 2 : my0 + offset_y + 17, mx0 + offset_x - 2 : mx0 + offset_x + 17] = np.asarray(self._agent_colors[agent_idx])
-                    
-                frame[my0 + offset_y : my0 + offset_y + 15, mx0 + offset_x : mx0 + offset_x + 15] = opt_upscaled
+                    picked_ring = correct_ring if int(option_id) == target_id else wrong_ring
+                    frame[
+                        my0 + offset_y - 2: my0 + offset_y + 17,
+                        mx0 + offset_x - 2: mx0 + offset_x + 17,
+                    ] = picked_ring
+
+                frame[my0 + offset_y: my0 + offset_y + 15, mx0 + offset_x: mx0 + offset_x + 15] = opt_upscaled
 
         return (frame * 255.0).astype(np.uint8)

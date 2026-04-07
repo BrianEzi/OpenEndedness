@@ -17,6 +17,7 @@ from training.loop import (
     make_two_doer_rollout_step,
 )
 from training.action_masking import mask_pick_actions_until_menu_visible
+from training.message_masking import hard_mask_inactive_message_bits
 from agents.mappo import (
     update_actor,
     update_actor_two_doer,
@@ -330,6 +331,10 @@ def initialize_two_doer_carry(doer, num_envs, num_doers, hidden_size):
     )
 
 
+def get_active_message_levels(fsq_levels, active_bits):
+    return tuple(fsq_levels[:active_bits])
+
+
 def format_two_doer_action(action: int) -> str:
     action_labels = (
         "stay",
@@ -355,20 +360,34 @@ def build_two_doer_trace_snapshot(step_count, state, messages, actions):
     message_np = np.asarray(messages[0], dtype=np.float32)
     action_list = [int(action) for action in np.asarray(actions).tolist()]
     action_names = [format_two_doer_action(action) for action in action_list]
+    target_items = np.asarray(state.target_items).tolist()
+    selected_slots = np.asarray(state.selected_option_idx).tolist()
+    attempts = np.asarray(state.selection_attempts).tolist()
+
+    def format_pick(agent_idx):
+        slot_idx = int(selected_slots[agent_idx])
+        if slot_idx < 0:
+            return "none"
+        return f"slot_{slot_idx}"
+
     left_text = "\n".join(
         [
             f"t={step_count:02d}",
             f"pos_a={positions[0]}",
+            f"target_a=id_{target_items[0]}",
             f"msg_a={format_message_vector(message_np[0])}",
             f"act_a={action_names[0]}",
+            f"pick_a={format_pick(0)} ({attempts[0]})",
         ]
     )
     right_text = "\n".join(
         [
             f"t={step_count:02d}",
             f"pos_b={positions[1]}",
+            f"target_b=id_{target_items[1]}",
             f"msg_b={format_message_vector(message_np[1])}",
             f"act_b={action_names[1]}",
+            f"pick_b={format_pick(1)} ({attempts[1]})",
         ]
     )
     trace_line = " ".join(
@@ -376,10 +395,14 @@ def build_two_doer_trace_snapshot(step_count, state, messages, actions):
             f"t={step_count:02d}",
             f"pos_a={positions[0]}",
             f"pos_b={positions[1]}",
+            f"target_a=id_{target_items[0]}",
             f"msg_a={format_message_vector(message_np[0])}",
             f"act_a={action_names[0]}",
+            f"pick_a={format_pick(0)}",
+            f"target_b=id_{target_items[1]}",
             f"msg_b={format_message_vector(message_np[1])}",
             f"act_b={action_names[1]}",
+            f"pick_b={format_pick(1)}",
         ]
     )
     return trace_line, left_text, right_text
@@ -473,6 +496,10 @@ def _run_two_doer_greedy_episode(
             symbolic_state,
             target_images,
         )
+        messages = hard_mask_inactive_message_bits(
+            messages,
+            active_bits=env.active_message_bits,
+        )
 
         batch_size, num_doers = local_views.shape[:2]
         flat_local_views = local_views.reshape((batch_size * num_doers,) + local_views.shape[2:])
@@ -499,6 +526,7 @@ def _run_two_doer_greedy_episode(
         masked_logits = mask_pick_actions_until_menu_visible(
             flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
             menu_images,
+            pick_only_phase=env.is_pick_object_phase,
         )
         actions = jnp.argmax(
             masked_logits[0],
@@ -714,16 +742,23 @@ def print_two_doer_perception_level_banner(level, label="TWO-DOER PERCEPTION LEV
 def print_two_doer_selection_level_banner(level, env, label="TWO-DOER SELECTION LEVEL"):
     if int(level) == 1:
         description = (
-            "LEVEL 1: each doer gets up to 2 selections; "
-            f"wrong picks cost {float(env.wrong_selection_penalty):.2f}"
+            "Pick_Object: doers are frozen at goal tiles, only object picks are allowed, "
+            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}"
         )
     else:
-        description = "LEVEL 2: each doer gets exactly 1 selection"
+        description = (
+            "Full_Training: normal starts, corridor crossing, and object selection; "
+            f"active_msg_bits={env.active_message_bits}, max_selection_attempts={env.max_selection_attempts}"
+        )
     print("")
     print("=" * 72)
     print(label)
-    print(f"LEVEL {int(level)} | max_selection_attempts={env.max_selection_attempts}")
+    print(f"PHASE {int(level)} | {env.phase_name}")
     print(description)
+    print(
+        f"wrong_pick_penalties=({float(env.wrong_selection_penalty):.2f}, "
+        f"{float(env.wrong_selection_penalty_after_first):.2f}+)"
+    )
     print("=" * 72)
     print("")
 
@@ -733,6 +768,7 @@ def log_two_doer_selection_level(config, level, update, event):
         config,
         {
             "two_doer_selection_level": int(level),
+            "two_doer_curriculum_phase": "Pick_Object" if int(level) == 1 else "Full_Training",
             "two_doer_selection_level_event": str(event),
             "two_doer_selection_level_step": int(update),
         },
@@ -766,6 +802,8 @@ def visualize_two_doer_episode(
     success = False
     frames = []
     trace_lines = []
+    last_messages = None
+    last_actions = None
 
     while not bool(done) and step_count < config["episode_max_steps"]:
         global_map = obs["global_map"][None, ...]
@@ -782,6 +820,10 @@ def visualize_two_doer_episode(
             global_map,
             symbolic_state,
             target_images,
+        )
+        messages = hard_mask_inactive_message_bits(
+            messages,
+            active_bits=env.active_message_bits,
         )
 
         batch_size, num_doers = local_views.shape[:2]
@@ -809,6 +851,7 @@ def visualize_two_doer_episode(
         masked_logits = mask_pick_actions_until_menu_visible(
             flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
             menu_images,
+            pick_only_phase=env.is_pick_object_phase,
         )
         actions = jnp.argmax(
             masked_logits[0],
@@ -823,6 +866,8 @@ def visualize_two_doer_episode(
         frame = env.render(state)
         frames.append(annotate_two_doer_frame(frame, left_text, right_text))
         trace_lines.append(trace_line)
+        last_messages = messages
+        last_actions = actions
 
         rng, step_rng = jax.random.split(rng)
         obs, state, _, done, info = env.step(
@@ -836,6 +881,16 @@ def visualize_two_doer_episode(
 
     final_status = "solved" if success else "stopped"
     trace_lines.append(f"end={final_status} steps={step_count}")
+    if frames and last_messages is not None and last_actions is not None:
+        _, left_text, right_text = build_two_doer_trace_snapshot(
+            step_count,
+            state,
+            last_messages,
+            last_actions,
+        )
+        left_text = f"{left_text}\nfinal=1"
+        right_text = f"{right_text}\nfinal=1"
+        frames.append(annotate_two_doer_frame(env.render(state), left_text, right_text))
 
     if frames:
         frames[0].save(
@@ -876,11 +931,14 @@ def run_two_doer_training(config):
         progress_reward_scale=config["progress_reward_scale"],
         goal_reward=config["goal_reward"],
         wrong_selection_penalty=config["wrong_selection_penalty"],
+        wrong_selection_penalty_after_first=config["wrong_selection_penalty_after_first"],
         step_penalty=config["step_penalty"],
         wall_penalty=config["wall_penalty"],
         collision_penalty=config["collision_penalty"],
         doer_perception_level=config["doer_perception_level"],
         selection_phase_level=config["two_doer_selection_level_start"],
+        max_selection_attempts=config["two_doer_max_selection_attempts"],
+        pick_object_max_steps=config["pick_object_max_steps"],
     )
     curriculum_active = (
         config["use_two_doer_start_curriculum"]
@@ -1007,7 +1065,9 @@ def run_two_doer_training(config):
             seer.apply,
             doer.apply,
             actor_rng,
-            tuple(config["fsq_levels"]),
+            get_active_message_levels(config["fsq_levels"], env.active_message_bits),
+            env.active_message_bits,
+            env.is_pick_object_phase,
             jnp.asarray(config["seer_entropy_coef"], dtype=jnp.float32),
         )
         critic_state, critic_metrics = update_critic_two_doer(
@@ -1020,15 +1080,26 @@ def run_two_doer_training(config):
         params["doer"] = actor_state.params["doer"]
         params["critic"] = critic_state.params
 
-        success_events = jnp.logical_and(
+        eventual_success_events = jnp.logical_and(
             trajectory_batch.done,
-            trajectory_batch.task_reward > 0.0,
+            trajectory_batch.eventual_success,
+        )
+        first_try_success_events = jnp.logical_and(
+            trajectory_batch.done,
+            trajectory_batch.first_try_success,
         )
         completed_episodes = trajectory_batch.done.astype(jnp.int32).sum()
-        rollout_num_successes = success_events.astype(jnp.int32).sum()
-        rollout_success_rate = jnp.where(
+        rollout_num_eventual_successes = eventual_success_events.astype(jnp.int32).sum()
+        rollout_num_first_try_successes = first_try_success_events.astype(jnp.int32).sum()
+        eventual_success_rate = jnp.where(
             completed_episodes > 0,
-            rollout_num_successes.astype(jnp.float32)
+            rollout_num_eventual_successes.astype(jnp.float32)
+            / completed_episodes.astype(jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        first_try_success_rate = jnp.where(
+            completed_episodes > 0,
+            rollout_num_first_try_successes.astype(jnp.float32)
             / completed_episodes.astype(jnp.float32),
             jnp.asarray(0.0, dtype=jnp.float32),
         )
@@ -1039,7 +1110,11 @@ def run_two_doer_training(config):
             total_correct_selections / total_valid_selections,
             jnp.asarray(0.0, dtype=jnp.float32),
         )
-        message_stats = compute_message_stats(trajectory_batch.message, config["fsq_levels"])
+        active_message_levels = get_active_message_levels(config["fsq_levels"], env.active_message_bits)
+        message_stats = compute_message_stats(
+            trajectory_batch.message[..., :env.active_message_bits],
+            active_message_levels,
+        )
         rng, cic_rng = jax.random.split(rng)
         cic_score = compute_two_doer_cic(
             doer.apply,
@@ -1057,12 +1132,16 @@ def run_two_doer_training(config):
                         "task_variant": config["task_variant"],
                         "doer_perception_level": env.doer_perception_level,
                         "two_doer_selection_level": env.selection_phase_level,
+                        "two_doer_curriculum_phase": env.phase_name,
+                        "active_message_bits": env.active_message_bits,
                         "curriculum_fixed_starts": int(curriculum_active),
                         "curriculum_eval_gate_passed": int(
-                            rollout_success_rate >= config["curriculum_rollout_success_threshold"]
+                            first_try_success_rate >= config["curriculum_rollout_success_threshold"]
                         ),
                         "mastered_start_positions": mastered_start_positions,
-                        "rollout_success_rate": rollout_success_rate,
+                        "rollout_success_rate": first_try_success_rate,
+                        "eventual_success_rate": eventual_success_rate,
+                        "first_try_success_rate": first_try_success_rate,
                         "team_reward": trajectory_batch.reward.mean(),
                         "task_reward": trajectory_batch.task_reward.mean(),
                         "individual_selection_reward": trajectory_batch.individual_selection_reward.mean(),
@@ -1087,12 +1166,13 @@ def run_two_doer_training(config):
                 )
             print(
                 f"Update {update}/{num_updates} | "
-                f"Level: {env.selection_phase_level} | "
+                f"Phase: {env.phase_name} | "
                 f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
-                f"EvalGate: {int(rollout_success_rate >= config['curriculum_rollout_success_threshold'])} | "
+                f"EvalGate: {int(first_try_success_rate >= config['curriculum_rollout_success_threshold'])} | "
                 f"Mastered: {mastered_start_positions}/"
                 f"{config['two_doer_required_start_positions']} | "
-                f"SuccessRate: {float(rollout_success_rate):.3f} | "
+                f"SuccessRate: {float(first_try_success_rate):.3f} | "
+                f"Eventual: {float(eventual_success_rate):.3f} | "
                 f"SelAcc: {float(selection_accuracy):.3f} | "
                 f"Sel: {float(total_correct_selections):.0f}/{float(total_valid_selections):.0f} | "
                 f"TeamReward: {trajectory_batch.reward.mean():.3f} | "
@@ -1113,7 +1193,7 @@ def run_two_doer_training(config):
 
         if (
             env.selection_phase_level == 1
-            and float(rollout_success_rate) > config["two_doer_selection_level_advance_threshold"]
+            and float(first_try_success_rate) > config["two_doer_selection_level_advance_threshold"]
         ):
             env.set_selection_phase_level(2)
             step_fn = make_two_doer_rollout_step(
@@ -1149,7 +1229,7 @@ def run_two_doer_training(config):
 
         if update > 0 and update % config["eval_every"] == 0:
             gate_passed = bool(
-                float(rollout_success_rate) >= config["curriculum_rollout_success_threshold"]
+                float(first_try_success_rate) >= config["curriculum_rollout_success_threshold"]
             )
             greedy_solved = False
             if gate_passed:
@@ -1174,7 +1254,7 @@ def run_two_doer_training(config):
                 print(
                     f"Greedy eval @ {update}: "
                     f"gate_passed=0 skipped "
-                    f"(rollout_success_rate={float(rollout_success_rate):.3f})"
+                    f"(rollout_success_rate={float(first_try_success_rate):.3f})"
                 )
             maybe_wandb_log(
                 config,
@@ -1242,19 +1322,19 @@ def run_two_doer_training(config):
                 update,
                 fixed_positions=fixed_positions,
             )
-            if float(rollout_success_rate) >= 1.0:
+            if float(first_try_success_rate) >= 1.0:
                 global_step = int((update + 1) * config["num_steps"] * config["num_envs"])
                 print("")
                 print("=" * 72)
                 print(
-                    "SUCCESSFUL: rollout_success_rate reached 1.000 after visualization "
+                    "SUCCESSFUL: first_try_success_rate reached 1.000 after visualization "
                     f"at global_step={global_step}"
                 )
                 print("=" * 72)
                 print("")
                 if not viz_success:
                     print(
-                        "Visualization episode did not solve despite rollout_success_rate=1.000; "
+                        "Visualization episode did not solve despite first_try_success_rate=1.000; "
                         "continuing with checkpoint save and termination."
                     )
                 probe_and_save_codebook(
@@ -1306,11 +1386,14 @@ def main():
         "follow_reward_scale": 0.1,
         "progress_reward_scale": 0.1,
         "wrong_selection_penalty": 0.15,
+        "wrong_selection_penalty_after_first": 0.30,
         "cic_coef": 0.01,
         "seer_entropy_coef": 0.05,
         "doer_perception_level": 2,
-        "two_doer_selection_level_start": 2,
+        "two_doer_selection_level_start": 1,
         "two_doer_selection_level_advance_threshold": 0.90,
+        "two_doer_max_selection_attempts": 4,
+        "pick_object_max_steps": 8,
         "max_doer_perception_level": 3,
         "curriculum_success_streak": 3,
         "curriculum_eval_every": 25,

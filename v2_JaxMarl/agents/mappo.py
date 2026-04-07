@@ -8,6 +8,7 @@ from typing import Tuple, Any, Callable
 import distrax 
 import optax
 from training.action_masking import mask_pick_actions_until_menu_visible
+from training.message_masking import hard_mask_inactive_message_bits
 
 # 1. Data Structures: Meticulous shape tracking
 # Using chex helps enforce accuracy by allowing us to assert shapes later.
@@ -55,6 +56,8 @@ class TwoDoerTransition:
     individual_selection_reward: chex.Array
     valid_selection_count: chex.Array
     correct_selection_count: chex.Array
+    eventual_success: chex.Array
+    first_try_success: chex.Array
     progress_reward_per_doer: chex.Array
     step_penalty_component: chex.Array
     wall_penalty_component: chex.Array
@@ -246,6 +249,8 @@ def calculate_two_doer_actor_losses(
     init_seer_carry: Tuple[jnp.ndarray, jnp.ndarray],
     init_doer_carry: Tuple[jnp.ndarray, jnp.ndarray],
     message_levels: Tuple[int, ...],
+    active_message_bits: int,
+    pick_only_phase: bool,
     clip_eps: float = 0.2,
     entropy_coef: float = 0.01,
     seer_entropy_coef: jnp.ndarray = jnp.array(0.01),
@@ -260,6 +265,10 @@ def calculate_two_doer_actor_losses(
             transition_step.global_obs,
             transition_step.symbolic_obs,
             transition_step.target_images,
+        )
+        discrete_messages = hard_mask_inactive_message_bits(
+            discrete_messages,
+            active_bits=active_message_bits,
         )
         batch_size, num_doers = transition_step.local_obs.shape[:2]
         flat_local_obs = transition_step.local_obs.reshape(
@@ -291,6 +300,7 @@ def calculate_two_doer_actor_losses(
         doer_logits = mask_pick_actions_until_menu_visible(
             doer_logits,
             transition_step.menu_images,
+            pick_only_phase=pick_only_phase,
         )
         return (next_seer_carry, next_doer_carry), (doer_logits, discrete_messages)
 
@@ -370,6 +380,8 @@ import functools
         "seer_apply_fn",
         "doer_apply_fn",
         "message_levels",
+        "active_message_bits",
+        "pick_only_phase",
         "num_ppo_epochs",
         "num_minibatches",
     ),
@@ -566,6 +578,8 @@ def update_actor_two_doer(
     doer_apply_fn: Callable,
     rng: jax.random.PRNGKey,
     message_levels: Tuple[int, ...],
+    active_message_bits: int,
+    pick_only_phase: bool,
     seer_entropy_coef: jnp.ndarray,
     num_ppo_epochs: int = 4,
     num_minibatches: int = 1,
@@ -597,6 +611,8 @@ def update_actor_two_doer(
                     mb_seer_carry,
                     mb_doer_carry,
                     message_levels=message_levels,
+                    active_message_bits=active_message_bits,
+                    pick_only_phase=pick_only_phase,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return seer_loss, metrics
@@ -610,6 +626,8 @@ def update_actor_two_doer(
                     mb_seer_carry,
                     mb_doer_carry,
                     message_levels=message_levels,
+                    active_message_bits=active_message_bits,
+                    pick_only_phase=pick_only_phase,
                     seer_entropy_coef=seer_entropy_coef,
                 )
                 return doer_loss, metrics
