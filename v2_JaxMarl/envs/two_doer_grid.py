@@ -249,7 +249,7 @@ class TwoDoerBottleneckEnv:
                 [
                     jnp.zeros_like(position_features),
                     agent_identity,
-                    jnp.zeros_like(goals_reached[:, None]),
+                    goals_reached[:, None],
                 ],
                 axis=-1,
             )
