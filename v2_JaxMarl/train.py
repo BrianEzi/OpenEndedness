@@ -1384,7 +1384,7 @@ def main():
         "learning_rate": 3e-4,
         "num_envs": 16,
         "num_steps": 64,
-        "total_timesteps": 3_000_000,
+        "total_timesteps": 30_000_000,
         "env_id": "Navix-Empty-Random-8x8-v0",
         "fsq_levels": [2, 2, 2, 2],
         "seed": 42,

@@ -49,8 +49,14 @@ class Doer(nn.Module):
         x_flat = x.reshape((x.shape[0], -1))
         
         # 3. Proprioception Encoder
-        p = nn.Dense(features=16)(proprioception)
-        p = nn.relu(p)
+        # Split into position features (first 2 dims) and identity/state features (remaining).
+        # At perception level 3, position dims are zeroed out in the env, so we keep them
+        # in separate sub-encoders to avoid dead weights in the identity/state pathway.
+        pos_features = proprioception[..., :2]       # [row/H, col/W] or zeros at lvl 3
+        id_state_features = proprioception[..., 2:]  # [agent_id_0, agent_id_1, goals_reached]
+        p_pos = nn.relu(nn.Dense(features=8)(pos_features))
+        p_id = nn.relu(nn.Dense(features=8)(id_state_features))
+        p = jnp.concatenate([p_pos, p_id], axis=-1)  # (batch, 16) — same total size
         
         # 4. Menu Images Encoder
         # menu_images shape is (batch, 4, 5, 5, 3)
