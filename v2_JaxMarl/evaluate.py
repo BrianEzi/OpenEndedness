@@ -746,13 +746,22 @@ def probe_selection_semantics(
     bank = pick_env.item_bank
     num_items = int(bank.shape[0])
     results = {"doer_a": {}, "doer_b": {}}
-    pick_available_sequence = [
-        step_idx >= pick_env.pick_object_listen_steps for step_idx in range(sequence_length)
-    ]
 
     sequences = all_message_sequences(fsq_levels, sequence_length)
     all_seqs_array = jnp.asarray(sequences, dtype=jnp.float32)  # (N, seq_len, msg_dim)
     N_seq = len(sequences)
+
+    # Warm up LSTM: prepend listen_steps copies of each sequence's first message
+    # (pick blocked) so the LSTM has proper context when pick becomes available.
+    # This replicates the training situation where the doer listens before picking.
+    listen_steps = pick_env.pick_object_listen_steps
+    if listen_steps > 0:
+        first_msgs = all_seqs_array[:, 0:1, :]  # (N_seq, 1, msg_dim)
+        warmup = jnp.tile(first_msgs, (1, listen_steps, 1))  # (N_seq, listen_steps, msg_dim)
+        warmed_seqs_array = jnp.concatenate([warmup, all_seqs_array], axis=1)  # (N_seq, listen_steps+seq_len, msg_dim)
+    else:
+        warmed_seqs_array = all_seqs_array
+    pick_available_sequence = [False] * listen_steps + [True] * sequence_length
 
     def dominant_choice(chosen_items):
         object_counts = {}
@@ -790,18 +799,20 @@ def probe_selection_semantics(
                     menu_ids.insert(slot_idx, target_id)
                     menu_images = bank[jnp.asarray(menu_ids, dtype=jnp.int32)][None, ...]
 
-                    # Single batched call: returns (N_seq, seq_len) actions.
-                    action_traces = run_doer_sequences_batched(
+                    # Single batched call: returns (N_seq, listen_steps+seq_len) actions.
+                    action_traces_full = run_doer_sequences_batched(
                         doer,
                         doer_params,
                         local_obs,
                         proprioception,
-                        all_seqs_array,
+                        warmed_seqs_array,
                         menu_images,
                         hidden_size=hidden_size,
                         pick_only_phase=True,
                         pick_available_sequence=pick_available_sequence,
                     )
+                    # Discard warm-up steps — only look at the actual probe steps.
+                    action_traces = action_traces_full[:, listen_steps:]
 
                     for seq_idx in range(N_seq):
                         trace = action_traces[seq_idx]  # (seq_len,)
@@ -1181,6 +1192,160 @@ def analyze_rollout_messages(episodes, sample_limit=4):
     return analysis
 
 
+def analyze_empirical_pick_correlations(episodes):
+    """
+    For each unique message seen at a pick step, record what was picked.
+    Only counts steps where a pick action occurred (action >= 5).
+    Tracks item, color, and shape distributions, and whether the pick was correct.
+    Only the first pick per agent per episode is counted (ignores retries).
+    """
+    results = {}
+
+    for agent_idx, doer_key in enumerate(DOER_KEYS):
+        # msg_tuple -> {item_counts, color_counts, shape_counts, correct, total}
+        buckets = {}
+
+        for episode in episodes:
+            seen_first_pick = False
+            for step_record in episode["steps"]:
+                chosen_item = step_record["chosen_items"][agent_idx]
+                if chosen_item is None:
+                    continue  # not a pick step
+                if seen_first_pick:
+                    continue  # only count first pick per episode per agent
+                seen_first_pick = True
+
+                msg = tuple(step_record["messages"][agent_idx])
+                target_item = step_record["target_items"][agent_idx]
+
+                if msg not in buckets:
+                    buckets[msg] = {
+                        "item_counts": Counter(),
+                        "color_counts": Counter(),
+                        "shape_counts": Counter(),
+                        "correct": 0,
+                        "total": 0,
+                    }
+
+                b = buckets[msg]
+                b["total"] += 1
+                b["item_counts"][chosen_item] += 1
+                b["color_counts"][COLOR_NAMES[chosen_item // 4]] += 1
+                b["shape_counts"][SHAPE_NAMES[chosen_item % 4]] += 1
+                if chosen_item == target_item:
+                    b["correct"] += 1
+
+        summary = {}
+        for msg, b in sorted(buckets.items(), key=lambda x: -x[1]["total"]):
+            n = b["total"]
+            top_item_id, top_item_n = b["item_counts"].most_common(1)[0]
+            top_color, top_color_n = b["color_counts"].most_common(1)[0]
+            top_shape, top_shape_n = b["shape_counts"].most_common(1)[0]
+            summary[str(msg)] = {
+                "message": list(msg),
+                "n_picks": n,
+                "correct_rate": b["correct"] / n,
+                "top_item": item_label(top_item_id),
+                "top_item_rate": top_item_n / n,
+                "top_color": top_color,
+                "top_color_rate": top_color_n / n,
+                "top_shape": top_shape,
+                "top_shape_rate": top_shape_n / n,
+                "item_counts": {item_label(k): v for k, v in b["item_counts"].items()},
+                "color_counts": dict(b["color_counts"]),
+                "shape_counts": dict(b["shape_counts"]),
+            }
+
+        results[doer_key] = summary
+
+    return results
+
+
+def analyze_empirical_bit_compositionality(pick_correlations, fsq_levels):
+    """
+    For each bit position, partition messages into bit=0 vs bit=1 groups and
+    measure whether that split predicts color or shape.
+    Reports purity: fraction of picks matching the dominant color/shape for each group.
+    """
+    results = {}
+    num_bits = len(fsq_levels)
+
+    for doer_key in DOER_KEYS:
+        summary = pick_correlations[doer_key]
+        bit_results = {}
+
+        for bit_idx in range(num_bits):
+            groups = {v: {"color_counts": Counter(), "shape_counts": Counter(), "total": 0}
+                      for v in range(fsq_levels[bit_idx])}
+
+            for entry in summary.values():
+                msg = entry["message"]
+                bit_val = int(msg[bit_idx])
+                if bit_val not in groups:
+                    continue
+                g = groups[bit_val]
+                n = entry["n_picks"]
+                g["total"] += n
+                for color, cnt in entry["color_counts"].items():
+                    g["color_counts"][color] += cnt
+                for shape, cnt in entry["shape_counts"].items():
+                    g["shape_counts"][shape] += cnt
+
+            bit_summary = {}
+            for bit_val, g in groups.items():
+                n = g["total"]
+                if n == 0:
+                    bit_summary[bit_val] = None
+                    continue
+                top_color, top_color_n = g["color_counts"].most_common(1)[0] if g["color_counts"] else (None, 0)
+                top_shape, top_shape_n = g["shape_counts"].most_common(1)[0] if g["shape_counts"] else (None, 0)
+                bit_summary[bit_val] = {
+                    "n": n,
+                    "top_color": top_color,
+                    "color_purity": top_color_n / n if n else 0.0,
+                    "top_shape": top_shape,
+                    "shape_purity": top_shape_n / n if n else 0.0,
+                }
+            bit_results[bit_idx] = bit_summary
+
+        results[doer_key] = bit_results
+
+    return results
+
+
+def print_empirical_pick_correlations(pick_correlations, bit_compositionality, limit=20):
+    for doer_key in DOER_KEYS:
+        summary = pick_correlations[doer_key]
+        print(f"\n{'='*80}")
+        print(f"  {doer_key.upper()} — Empirical Message→Pick Correlations (first pick per episode)")
+        print(f"{'='*80}")
+        header = f"{'Message':<22} {'N':>5}  {'Top Item':<26} {'Top Color':<18} {'Top Shape':<18} {'Correct%':>8}"
+        print(header)
+        print("-" * len(header))
+        for entry in list(summary.values())[:limit]:
+            msg_str = str(entry["message"])
+            item_str = f"{entry['top_item']} ({entry['top_item_rate']:.2f})"
+            color_str = f"{entry['top_color']} ({entry['top_color_rate']:.2f})"
+            shape_str = f"{entry['top_shape']} ({entry['top_shape_rate']:.2f})"
+            print(
+                f"{msg_str:<22} {entry['n_picks']:>5}  {item_str:<26} {color_str:<18} {shape_str:<18} {entry['correct_rate']:>8.2f}"
+            )
+
+        print(f"\n  Bit-level compositionality ({doer_key}):")
+        bit_results = bit_compositionality[doer_key]
+        for bit_idx, bit_summary in bit_results.items():
+            parts = []
+            for bit_val, g in sorted(bit_summary.items()):
+                if g is None:
+                    continue
+                parts.append(
+                    f"bit{bit_idx}={bit_val}: n={g['n']} | "
+                    f"color→{g['top_color']} ({g['color_purity']:.2f}) | "
+                    f"shape→{g['top_shape']} ({g['shape_purity']:.2f})"
+                )
+            print(f"    bit {bit_idx}: " + "  //  ".join(parts))
+
+
 def build_empirical_summary_lines(empirical_analysis, limit):
     lines = []
     for doer_key in DOER_KEYS:
@@ -1253,6 +1418,9 @@ def main():
         empirical_analysis,
         limit=args.print_summary_limit,
     )
+
+    pick_correlations = analyze_empirical_pick_correlations(episodes)
+    bit_compositionality = analyze_empirical_bit_compositionality(pick_correlations, fsq_levels)
 
     nav_env, nav_obs, pick_env, pick_obs = build_eval_contexts(args)
 
@@ -1342,6 +1510,8 @@ def main():
         },
         "empirical_rollout_analysis": empirical_analysis,
         "empirical_summary_lines": empirical_summary_lines,
+        "empirical_pick_correlations": pick_correlations,
+        "empirical_bit_compositionality": bit_compositionality,
         "single_message_semantic_map": semantic_map,
         "compositionality": compositionality,
         "single_message_summary_lines": single_message_summary_lines,
@@ -1379,6 +1549,11 @@ def main():
     print("=" * 72)
     for line in empirical_summary_lines:
         print(line)
+
+    print("")
+    print_empirical_pick_correlations(
+        pick_correlations, bit_compositionality, limit=args.print_summary_limit
+    )
 
 
 if __name__ == "__main__":
