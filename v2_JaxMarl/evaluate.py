@@ -640,6 +640,56 @@ def run_doer_sequence(
     }
 
 
+def run_doer_sequences_batched(
+    doer,
+    doer_params,
+    local_obs,
+    proprioception,
+    all_sequences,
+    menu_images,
+    hidden_size,
+    pick_only_phase,
+    pick_available_sequence=None,
+):
+    """Run all message sequences in a single batched forward pass per step.
+
+    all_sequences: (N, seq_len, msg_dim) float32 array
+    Returns action_traces as (N, seq_len) int32 numpy array.
+    """
+    N, seq_len, _ = all_sequences.shape
+    # Tile fixed inputs to batch size N.
+    local_obs_b = jnp.broadcast_to(local_obs, (N,) + local_obs.shape[1:])
+    prop_b = jnp.broadcast_to(proprioception, (N,) + proprioception.shape[1:])
+    menu_b = jnp.broadcast_to(menu_images, (N,) + menu_images.shape[1:])
+
+    carry = doer.initialize_carry(batch_size=N, hidden_size=hidden_size)
+    action_traces = []
+
+    for step_idx in range(seq_len):
+        messages_step = all_sequences[:, step_idx, :]  # (N, msg_dim)
+        carry, logits = doer.apply(
+            {"params": doer_params},
+            carry,
+            local_obs_b,
+            prop_b,
+            messages_step,
+            menu_b,
+        )
+        pick_available = None
+        if pick_available_sequence is not None:
+            pick_available = jnp.full((N,), pick_available_sequence[step_idx], dtype=bool)
+        masked_logits = mask_pick_actions_until_menu_visible(
+            logits,
+            menu_b,
+            pick_only_phase=pick_only_phase,
+            pick_available=pick_available,
+        )
+        actions = np.asarray(jnp.argmax(masked_logits, axis=-1), dtype=np.int32)
+        action_traces.append(actions)
+
+    return np.stack(action_traces, axis=1)  # (N, seq_len)
+
+
 def build_eval_contexts(args):
     nav_env = build_env(args, selection_phase_level=2)
     fixed_positions = jnp.asarray(
@@ -655,26 +705,30 @@ def build_eval_contexts(args):
 
 def probe_navigation_semantics(doer, doer_params, nav_obs, fsq_levels, sequence_length, hidden_size):
     results = {"doer_a": {}, "doer_b": {}}
+    sequences = all_message_sequences(fsq_levels, sequence_length)
+    all_seqs_array = jnp.asarray(sequences, dtype=jnp.float32)  # (N, seq_len, msg_dim)
     zero_menu = jnp.zeros((1, 4, 5, 5, 3), dtype=jnp.float32)
 
     for doer_idx, doer_key in enumerate(DOER_KEYS):
         local_obs = nav_obs["local_views"][doer_idx][None, ...]
         proprioception = nav_obs["proprioceptions"][doer_idx][None, ...]
-        for message_sequence in all_message_sequences(fsq_levels, sequence_length):
-            rollout = run_doer_sequence(
-                doer,
-                doer_params,
-                local_obs,
-                proprioception,
-                message_sequence,
-                zero_menu,
-                hidden_size=hidden_size,
-                pick_only_phase=False,
-                pick_available_sequence=[False] * sequence_length,
-            )
+        # Single batched call for all sequences at once.
+        action_traces = run_doer_sequences_batched(
+            doer,
+            doer_params,
+            local_obs,
+            proprioception,
+            all_seqs_array,
+            zero_menu,
+            hidden_size=hidden_size,
+            pick_only_phase=False,
+            pick_available_sequence=[False] * sequence_length,
+        )  # (N, seq_len)
+        for seq_idx, message_sequence in enumerate(sequences):
+            trace = [int(action_traces[seq_idx, s]) for s in range(sequence_length)]
             results[doer_key][message_sequence_key(message_sequence)] = {
-                "action_trace": rollout["action_trace_labels"],
-                "final_action": action_label(rollout["final_action"]),
+                "action_trace": [action_label(a) for a in trace],
+                "final_action": action_label(trace[-1]),
             }
     return results
 
@@ -696,106 +750,102 @@ def probe_selection_semantics(
         step_idx >= pick_env.pick_object_listen_steps for step_idx in range(sequence_length)
     ]
 
+    sequences = all_message_sequences(fsq_levels, sequence_length)
+    all_seqs_array = jnp.asarray(sequences, dtype=jnp.float32)  # (N, seq_len, msg_dim)
+    N_seq = len(sequences)
+
+    def dominant_choice(chosen_items):
+        object_counts = {}
+        for chosen_item in chosen_items:
+            if chosen_item is None:
+                continue
+            object_counts[chosen_item] = object_counts.get(chosen_item, 0) + 1
+        dominant_id, dominant_count = None, 0
+        for choice_id, count in object_counts.items():
+            if count > dominant_count:
+                dominant_id, dominant_count = choice_id, count
+        return dominant_id, dominant_count
+
     for doer_idx, doer_key in enumerate(DOER_KEYS):
         local_obs = pick_obs["local_views"][doer_idx][None, ...]
         proprioception = pick_obs["proprioceptions"][doer_idx][None, ...]
 
-        for message_sequence in all_message_sequences(fsq_levels, sequence_length):
-            per_target = {}
+        # Accumulators keyed by (seq_idx, target_id).
+        first_pick_hits = {(s, t): 0 for s in range(N_seq) for t in range(num_items)}
+        final_pick_hits = {(s, t): 0 for s in range(N_seq) for t in range(num_items)}
+        no_picks = {(s, t): 0 for s in range(N_seq) for t in range(num_items)}
+        total_trials = {(s, t): 0 for s in range(N_seq) for t in range(num_items)}
+        first_pick_objects = {(s, t): [] for s in range(N_seq) for t in range(num_items)}
+        final_pick_objects = {(s, t): [] for s in range(N_seq) for t in range(num_items)}
 
-            for target_id in range(num_items):
-                first_pick_target_hits = 0
-                final_pick_target_hits = 0
-                total_trials = 0
-                first_pick_objects = []
-                final_pick_objects = []
-                no_pick = 0
+        # Outer loop: menu configurations (16 targets × 4 packs × 4 slots = 256 configs).
+        # One batched call per config runs all N_seq sequences at once.
+        for target_id in range(num_items):
+            for distractors in distractor_packs_for_target(
+                target_id, num_items=num_items, num_packs=distractor_packs
+            ):
+                base_menu = list(distractors)
+                for slot_idx in range(4):
+                    menu_ids = base_menu.copy()
+                    menu_ids.insert(slot_idx, target_id)
+                    menu_images = bank[jnp.asarray(menu_ids, dtype=jnp.int32)][None, ...]
 
-                for distractors in distractor_packs_for_target(
-                    target_id,
-                    num_items=num_items,
-                    num_packs=distractor_packs,
-                ):
-                    base_menu = list(distractors)
-                    for slot_idx in range(4):
-                        menu_ids = base_menu.copy()
-                        menu_ids.insert(slot_idx, target_id)
-                        menu_images = bank[jnp.asarray(menu_ids, dtype=jnp.int32)][None, ...]
-                        rollout = run_doer_sequence(
-                            doer,
-                            doer_params,
-                            local_obs,
-                            proprioception,
-                            message_sequence,
-                            menu_images,
-                            hidden_size=hidden_size,
-                            pick_only_phase=True,
-                            pick_available_sequence=pick_available_sequence,
+                    # Single batched call: returns (N_seq, seq_len) actions.
+                    action_traces = run_doer_sequences_batched(
+                        doer,
+                        doer_params,
+                        local_obs,
+                        proprioception,
+                        all_seqs_array,
+                        menu_images,
+                        hidden_size=hidden_size,
+                        pick_only_phase=True,
+                        pick_available_sequence=pick_available_sequence,
+                    )
+
+                    for seq_idx in range(N_seq):
+                        trace = action_traces[seq_idx]  # (seq_len,)
+                        first_pick_step = next(
+                            (s for s in range(sequence_length) if int(trace[s]) >= 5),
+                            None,
                         )
-                        total_trials += 1
-                        first_pick_step = rollout["first_pick_step"]
-                        final_action = rollout["final_action"]
+                        final_action = int(trace[-1])
+                        total_trials[(seq_idx, target_id)] += 1
 
                         if first_pick_step is None:
-                            no_pick += 1
-                            first_pick_objects.append(None)
+                            no_picks[(seq_idx, target_id)] += 1
+                            first_pick_objects[(seq_idx, target_id)].append(None)
                         else:
-                            first_pick_action = rollout["action_trace"][first_pick_step]
+                            first_pick_action = int(trace[first_pick_step])
                             first_pick_item = int(menu_ids[first_pick_action - 5])
-                            first_pick_objects.append(first_pick_item)
+                            first_pick_objects[(seq_idx, target_id)].append(first_pick_item)
                             if first_pick_item == target_id:
-                                first_pick_target_hits += 1
+                                first_pick_hits[(seq_idx, target_id)] += 1
 
                         if final_action < 5:
-                            final_pick_objects.append(None)
+                            final_pick_objects[(seq_idx, target_id)].append(None)
                         else:
                             final_pick_item = int(menu_ids[final_action - 5])
-                            final_pick_objects.append(final_pick_item)
+                            final_pick_objects[(seq_idx, target_id)].append(final_pick_item)
                             if final_pick_item == target_id:
-                                final_pick_target_hits += 1
+                                final_pick_hits[(seq_idx, target_id)] += 1
 
-                def dominant_choice(chosen_items):
-                    object_counts = {}
-                    for chosen_item in chosen_items:
-                        if chosen_item is None:
-                            continue
-                        object_counts[chosen_item] = object_counts.get(chosen_item, 0) + 1
-                    dominant_choice_id = None
-                    dominant_choice_count = 0
-                    for choice_id, count in object_counts.items():
-                        if count > dominant_choice_count:
-                            dominant_choice_id = choice_id
-                            dominant_choice_count = count
-                    return dominant_choice_id, dominant_choice_count
-
-                first_dominant_choice_id, first_dominant_choice_count = dominant_choice(first_pick_objects)
-                final_dominant_choice_id, final_dominant_choice_count = dominant_choice(final_pick_objects)
-
+        # Assemble results in the original per-sequence structure.
+        for seq_idx, message_sequence in enumerate(sequences):
+            per_target = {}
+            for target_id in range(num_items):
+                n = total_trials[(seq_idx, target_id)]
+                fd_id, fd_count = dominant_choice(first_pick_objects[(seq_idx, target_id)])
+                fn_id, fn_count = dominant_choice(final_pick_objects[(seq_idx, target_id)])
                 per_target[item_label(target_id)] = {
                     "item_id": target_id,
-                    "first_pick_target_hit_rate": (
-                        first_pick_target_hits / total_trials if total_trials else 0.0
-                    ),
-                    "final_pick_target_hit_rate": (
-                        final_pick_target_hits / total_trials if total_trials else 0.0
-                    ),
-                    "no_pick_rate": no_pick / total_trials if total_trials else 0.0,
-                    "dominant_first_pick_object": (
-                        item_label(first_dominant_choice_id)
-                        if first_dominant_choice_id is not None
-                        else None
-                    ),
-                    "dominant_first_pick_rate": (
-                        first_dominant_choice_count / total_trials if total_trials else 0.0
-                    ),
-                    "dominant_final_pick_object": (
-                        item_label(final_dominant_choice_id)
-                        if final_dominant_choice_id is not None
-                        else None
-                    ),
-                    "dominant_final_pick_rate": (
-                        final_dominant_choice_count / total_trials if total_trials else 0.0
-                    ),
+                    "first_pick_target_hit_rate": first_pick_hits[(seq_idx, target_id)] / n if n else 0.0,
+                    "final_pick_target_hit_rate": final_pick_hits[(seq_idx, target_id)] / n if n else 0.0,
+                    "no_pick_rate": no_picks[(seq_idx, target_id)] / n if n else 0.0,
+                    "dominant_first_pick_object": item_label(fd_id) if fd_id is not None else None,
+                    "dominant_first_pick_rate": fd_count / n if n else 0.0,
+                    "dominant_final_pick_object": item_label(fn_id) if fn_id is not None else None,
+                    "dominant_final_pick_rate": fn_count / n if n else 0.0,
                 }
 
             ranked_targets = sorted(
