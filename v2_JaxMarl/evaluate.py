@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--doer-perception-level",
         type=int,
-        default=3,
+        default=2,
         choices=(2, 3),
         help="Doer perception level to evaluate under.",
     )
