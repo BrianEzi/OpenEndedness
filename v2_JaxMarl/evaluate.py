@@ -158,17 +158,28 @@ def checkpoint_step_from_name(path: Path):
     return int(suffix)
 
 
+def is_orbax_checkpoint_dir(path: Path) -> bool:
+    return path.is_dir() and (path / "_CHECKPOINT_METADATA").exists()
+
+
 def find_checkpoint_path(checkpoint_path: Path) -> Path:
     direct_step = checkpoint_step_from_name(checkpoint_path)
     if direct_step is not None:
         return checkpoint_path
 
     if checkpoint_path.is_dir():
+        # Direct Orbax OCDBT checkpoint (e.g. downloaded from HuggingFace without a
+        # checkpoint_N wrapper directory).
+        if is_orbax_checkpoint_dir(checkpoint_path):
+            return checkpoint_path
+
         candidates = []
         for candidate in checkpoint_path.rglob("checkpoint_*"):
             step = checkpoint_step_from_name(candidate)
             if step is not None:
                 candidates.append((step, candidate))
+            elif is_orbax_checkpoint_dir(candidate):
+                candidates.append((0, candidate))
         if candidates:
             candidates.sort(key=lambda item: (item[0], str(item[1])))
             return candidates[-1][1]
@@ -182,20 +193,37 @@ def find_checkpoint_path(checkpoint_path: Path) -> Path:
 def resolve_checkpoint_location(checkpoint_path: Path):
     concrete_path = find_checkpoint_path(checkpoint_path.resolve())
     step = checkpoint_step_from_name(concrete_path)
-    if step is None:
-        raise ValueError(f"Invalid checkpoint path: {concrete_path}")
+    # step is None for Orbax checkpoints not following the checkpoint_N naming convention
     return concrete_path.parent, step, concrete_path
+
+
+def _restore_orbax(checkpoint_path: Path):
+    try:
+        import orbax.checkpoint as ocp
+    except ImportError as exc:
+        raise ImportError(
+            "Orbax checkpoint detected but orbax is not installed. "
+            "Install it with `pip install orbax-checkpoint`."
+        ) from exc
+    checkpointer = ocp.PyTreeCheckpointer()
+    return checkpointer.restore(str(checkpoint_path))
 
 
 def restore_params(checkpoint_ref: str):
     resolved_path = resolve_checkpoint_reference(checkpoint_ref)
     restore_dir, step, concrete_checkpoint_path = resolve_checkpoint_location(resolved_path)
-    params = checkpoints.restore_checkpoint(
-        ckpt_dir=str(restore_dir),
-        target=None,
-        step=step,
-        prefix="checkpoint_",
-    )
+
+    if step is None:
+        # Orbax OCDBT checkpoint
+        params = _restore_orbax(concrete_checkpoint_path)
+    else:
+        params = checkpoints.restore_checkpoint(
+            ckpt_dir=str(restore_dir),
+            target=None,
+            step=step,
+            prefix="checkpoint_",
+        )
+
     if params is None:
         raise FileNotFoundError(
             "Checkpoint restore returned None. "
