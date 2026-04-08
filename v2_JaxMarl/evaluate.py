@@ -870,6 +870,129 @@ def probe_selection_semantics(
     return results
 
 
+def build_message_semantic_map(single_nav_results, single_sel_results, fsq_levels):
+    """For each of the N single messages, return its best nav action and best item/color/shape.
+
+    Returns dict: doer_key → {msg_key: {action, item, color, shape, hit_rate}}
+    """
+    semantic_map = {}
+    for doer_key in DOER_KEYS:
+        mapping = {}
+        for msg_tuple in all_messages(fsq_levels):
+            seq_key = message_sequence_key((msg_tuple,))
+            nav = single_nav_results[doer_key].get(seq_key, {})
+            sel = single_sel_results[doer_key].get(seq_key, {})
+            best_label = sel.get("best_target_label")
+            if best_label is not None:
+                parts = best_label.split("_", 1)
+                color = parts[0] if len(parts) == 2 else "?"
+                shape = parts[1] if len(parts) == 2 else "?"
+            else:
+                color, shape = "?", "?"
+            mapping[str(list(msg_tuple))] = {
+                "msg": list(msg_tuple),
+                "nav_action": nav.get("final_action", "?"),
+                "best_item": best_label,
+                "color": color,
+                "shape": shape,
+                "hit_rate": sel.get("best_first_pick_hit_rate", 0.0),
+            }
+        semantic_map[doer_key] = mapping
+    return semantic_map
+
+
+def analyze_compositionality(semantic_map, fsq_levels):
+    """For each bit position, check how well bit=0 vs bit=1 separates colors and shapes.
+
+    Returns dict: doer_key → list of per-bit dicts.
+    """
+    result = {}
+    for doer_key in DOER_KEYS:
+        mapping = semantic_map[doer_key]
+        num_bits = len(fsq_levels)
+        bit_analysis = []
+        for bit_idx in range(num_bits):
+            groups = {v: {"colors": Counter(), "shapes": Counter()} for v in range(fsq_levels[bit_idx])}
+            for entry in mapping.values():
+                v = entry["msg"][bit_idx]
+                groups[v]["colors"][entry["color"]] += 1
+                groups[v]["shapes"][entry["shape"]] += 1
+            bit_info = {"bit": bit_idx, "groups": {}}
+            for v, counts in groups.items():
+                top_color = counts["colors"].most_common(1)
+                top_shape = counts["shapes"].most_common(1)
+                total = sum(counts["colors"].values())
+                bit_info["groups"][v] = {
+                    "colors": dict(counts["colors"]),
+                    "shapes": dict(counts["shapes"]),
+                    "dominant_color": top_color[0][0] if top_color else "?",
+                    "color_purity": top_color[0][1] / total if top_color and total else 0.0,
+                    "dominant_shape": top_shape[0][0] if top_shape else "?",
+                    "shape_purity": top_shape[0][1] / total if top_shape and total else 0.0,
+                }
+            bit_analysis.append(bit_info)
+        result[doer_key] = bit_analysis
+    return result
+
+
+def build_single_message_summary_lines(semantic_map, compositionality):
+    lines = []
+    for doer_key in DOER_KEYS:
+        lines.append(f"\n{doer_key}:")
+        lines.append("  Single messages:")
+        for msg_key, entry in semantic_map[doer_key].items():
+            lines.append(
+                f"    msg={msg_key:20s} | nav={entry['nav_action']:6s} "
+                f"| item={entry['best_item'] or '?':20s} (hit={entry['hit_rate']:.2f}) "
+                f"| color={entry['color']:8s} | shape={entry['shape']}"
+            )
+        lines.append("  Bit attribution:")
+        for bit_info in compositionality[doer_key]:
+            bit_idx = bit_info["bit"]
+            for v, ginfo in bit_info["groups"].items():
+                lines.append(
+                    f"    bit[{bit_idx}]={v} → "
+                    f"dominant_color={ginfo['dominant_color']:8s} (purity={ginfo['color_purity']:.2f}) | "
+                    f"dominant_shape={ginfo['dominant_shape']:12s} (purity={ginfo['shape_purity']:.2f}) | "
+                    f"all_colors={dict(ginfo['colors'])}"
+                )
+    return lines
+
+
+def build_pair_semantic_summary_lines(pair_sequences, navigation_results, selection_results,
+                                       semantic_map, fsq_levels, limit):
+    """Print pair-level summary annotated with per-message semantic labels."""
+    lines = []
+    single_messages = {str(list(m)): m for m in all_messages(fsq_levels)}
+
+    for doer_key in DOER_KEYS:
+        lines.append(f"\n{doer_key}:")
+        sel = selection_results[doer_key]
+        nav = navigation_results[doer_key]
+        count = 0
+        for seq_key, sel_entry in sel.items():
+            if count >= limit:
+                break
+            nav_entry = nav.get(seq_key, {})
+            # Parse the two messages from the sequence key "msg1 -> msg2"
+            parts = seq_key.split(" -> ")
+            sem_parts = []
+            for part in parts:
+                sem = semantic_map[doer_key].get(part, {})
+                label = f"{sem.get('color','?')}_{sem.get('shape','?')}"
+                sem_parts.append(label)
+            composite = " → ".join(sem_parts)
+            lines.append(
+                f"    seq={seq_key} | "
+                f"nav={'->'.join(nav_entry.get('action_trace', ['?']))} | "
+                f"item={sel_entry['best_target_label'] or '?':20s} "
+                f"(hit={sel_entry['best_first_pick_hit_rate']:.2f}) | "
+                f"semantic=[{composite}]"
+            )
+            count += 1
+    return lines
+
+
 def build_counterfactual_summary(message_sequences, navigation_results, selection_results):
     lines = []
     lines.append(
@@ -1132,29 +1255,47 @@ def main():
     )
 
     nav_env, nav_obs, pick_env, pick_obs = build_eval_contexts(args)
+
+    # --- Single-message probes (always at length=1) for semantic mapping ---
+    print("Running single-message probes...")
+    single_nav_results = probe_navigation_semantics(
+        doer, params["doer"], nav_obs, fsq_levels, sequence_length=1,
+        hidden_size=args.hidden_size,
+    )
+    single_sel_results = probe_selection_semantics(
+        doer, params["doer"], pick_env, pick_obs, fsq_levels,
+        distractor_packs=args.distractor_packs, sequence_length=1,
+        hidden_size=args.hidden_size,
+    )
+    semantic_map = build_message_semantic_map(single_nav_results, single_sel_results, fsq_levels)
+    compositionality = analyze_compositionality(semantic_map, fsq_levels)
+
+    # --- Pair probes (at requested sequence_length) ---
     message_sequences = all_message_sequences(fsq_levels, args.sequence_length)
-    navigation_results = probe_navigation_semantics(
-        doer,
-        params["doer"],
-        nav_obs,
-        fsq_levels,
-        args.sequence_length,
-        hidden_size=args.hidden_size,
-    )
-    selection_results = probe_selection_semantics(
-        doer,
-        params["doer"],
-        pick_env,
-        pick_obs,
-        fsq_levels,
-        distractor_packs=args.distractor_packs,
-        sequence_length=args.sequence_length,
-        hidden_size=args.hidden_size,
-    )
+    if args.sequence_length > 1:
+        print(f"Running sequence-length-{args.sequence_length} probes...")
+        navigation_results = probe_navigation_semantics(
+            doer, params["doer"], nav_obs, fsq_levels, args.sequence_length,
+            hidden_size=args.hidden_size,
+        )
+        selection_results = probe_selection_semantics(
+            doer, params["doer"], pick_env, pick_obs, fsq_levels,
+            distractor_packs=args.distractor_packs, sequence_length=args.sequence_length,
+            hidden_size=args.hidden_size,
+        )
+    else:
+        navigation_results = single_nav_results
+        selection_results = single_sel_results
+
     counterfactual_summary_lines = build_counterfactual_summary(
-        message_sequences,
-        navigation_results,
-        selection_results,
+        message_sequences, navigation_results, selection_results,
+    )
+    single_message_summary_lines = build_single_message_summary_lines(
+        semantic_map, compositionality,
+    )
+    pair_semantic_summary_lines = build_pair_semantic_summary_lines(
+        message_sequences, navigation_results, selection_results,
+        semantic_map, fsq_levels, limit=args.print_summary_limit,
     )
 
     success_rate = sum(1 for episode in episodes if episode["success"]) / max(len(episodes), 1)
@@ -1201,6 +1342,10 @@ def main():
         },
         "empirical_rollout_analysis": empirical_analysis,
         "empirical_summary_lines": empirical_summary_lines,
+        "single_message_semantic_map": semantic_map,
+        "compositionality": compositionality,
+        "single_message_summary_lines": single_message_summary_lines,
+        "pair_semantic_summary_lines": pair_semantic_summary_lines,
         "counterfactual_navigation_results": navigation_results,
         "counterfactual_selection_results": selection_results,
         "counterfactual_summary_lines": counterfactual_summary_lines,
@@ -1215,7 +1360,22 @@ def main():
     print(f"Saved greedy traces to {traces_path}")
     print(f"Saved communication report to {report_path}")
     print("")
-    print("Top Empirical Message-Pair Summaries")
+    print("=" * 72)
+    print("Single Message Semantics (controlled probe)")
+    print("=" * 72)
+    for line in single_message_summary_lines:
+        print(line)
+
+    print("")
+    print("=" * 72)
+    print(f"Top Message Pair Semantics (sequence_length={args.sequence_length})")
+    print("=" * 72)
+    for line in pair_semantic_summary_lines:
+        print(line)
+
+    print("")
+    print("=" * 72)
+    print("Top Empirical Message-Pair Summaries (from rollouts)")
     print("=" * 72)
     for line in empirical_summary_lines:
         print(line)
