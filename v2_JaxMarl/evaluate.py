@@ -145,32 +145,66 @@ def resolve_checkpoint_reference(checkpoint_ref: str) -> Path:
             "Install it with `pip install huggingface_hub` or pass a local checkpoint path."
         ) from exc
 
-    local_dir = snapshot_download(
-        repo_id=checkpoint_ref,
-        allow_patterns=["checkpoint_*", "*.json", "*.msgpack", "*.index"],
-    )
+    local_dir = snapshot_download(repo_id=checkpoint_ref)
     return Path(local_dir).resolve()
 
 
+def checkpoint_step_from_name(path: Path):
+    if not path.name.startswith("checkpoint_"):
+        return None
+    suffix = path.name.split("_")[-1]
+    if not suffix.isdigit():
+        return None
+    return int(suffix)
+
+
+def find_checkpoint_path(checkpoint_path: Path) -> Path:
+    direct_step = checkpoint_step_from_name(checkpoint_path)
+    if direct_step is not None:
+        return checkpoint_path
+
+    if checkpoint_path.is_dir():
+        candidates = []
+        for candidate in checkpoint_path.rglob("checkpoint_*"):
+            step = checkpoint_step_from_name(candidate)
+            if step is not None:
+                candidates.append((step, candidate))
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], str(item[1])))
+            return candidates[-1][1]
+
+    raise FileNotFoundError(
+        "Could not find any Flax checkpoint matching `checkpoint_*` under "
+        f"{checkpoint_path}"
+    )
+
+
 def resolve_checkpoint_location(checkpoint_path: Path):
-    if checkpoint_path.name.startswith("checkpoint_"):
-        step = int(checkpoint_path.name.split("_")[-1])
-        return checkpoint_path.parent, step
-    return checkpoint_path, None
+    concrete_path = find_checkpoint_path(checkpoint_path.resolve())
+    step = checkpoint_step_from_name(concrete_path)
+    if step is None:
+        raise ValueError(f"Invalid checkpoint path: {concrete_path}")
+    return concrete_path.parent, step, concrete_path
 
 
 def restore_params(checkpoint_ref: str):
     resolved_path = resolve_checkpoint_reference(checkpoint_ref)
-    restore_dir, step = resolve_checkpoint_location(resolved_path)
+    restore_dir, step, concrete_checkpoint_path = resolve_checkpoint_location(resolved_path)
     params = checkpoints.restore_checkpoint(
         ckpt_dir=str(restore_dir),
         target=None,
         step=step,
         prefix="checkpoint_",
     )
+    if params is None:
+        raise FileNotFoundError(
+            "Checkpoint restore returned None. "
+            f"Resolved repo/path: {resolved_path}. "
+            f"Concrete checkpoint candidate: {concrete_checkpoint_path}."
+        )
     if "seer" not in params or "doer" not in params:
         raise KeyError("Checkpoint must contain both `seer` and `doer` parameters.")
-    return params, resolved_path
+    return params, concrete_checkpoint_path
 
 
 def infer_message_dim_from_params(params) -> int:
