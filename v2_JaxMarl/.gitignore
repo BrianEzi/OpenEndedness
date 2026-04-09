@@ -1,0 +1,5 @@
+artifacts/
+final_codebook.json
+checkpoints/
+checkpoints-extended-comm/
+build_ipynb.py

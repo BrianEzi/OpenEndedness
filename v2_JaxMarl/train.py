@@ -1,0 +1,1946 @@
+import jax
+import jax.numpy as jnp
+import optax
+from pathlib import Path
+import flax.linen as nn
+from flax.training.train_state import TrainState
+
+# Import our custom modules
+from models.seer import Seer
+from models.doer import Doer
+from envs.navix_wrapper import NavixGridWrapper, UNSET_POSITION
+from envs.two_doer_grid import TwoDoerBottleneckEnv, UNSET_TWO_DOER_POSITIONS
+from training.loop import (
+    generate_trajectory_and_gae,
+    generate_two_doer_trajectory_and_gae,
+    make_rollout_step,
+    make_two_doer_rollout_step,
+)
+from training.action_masking import mask_pick_actions_until_menu_visible
+from training.message_masking import hard_mask_inactive_message_bits
+from agents.mappo import (
+    update_actor,
+    update_actor_two_doer,
+    update_critic,
+    update_critic_two_doer,
+    Transition,
+)
+import navix as nx
+from eval.visualize import visualize_episode
+from eval.metrics import compute_two_doer_cic
+import numpy as np
+try:
+    import wandb
+except ImportError:
+    wandb = None
+from PIL import Image, ImageDraw, ImageFont
+
+
+# For the sake of a complete script, here is a pragmatic, standard Critic
+class GlobalCritic(nn.Module):
+    """Evaluates the global state to guide learning (CTDE)."""
+    output_dim: int = 2
+
+    @nn.compact
+    def __call__(self, global_map: jnp.ndarray) -> jnp.ndarray:
+        x = nn.Conv(features=32, kernel_size=(3, 3))(global_map)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(features=128)(x)
+        x = nn.relu(x)
+        value = nn.Dense(features=self.output_dim)(x)
+        return value
+
+
+def wandb_enabled(config) -> bool:
+    return bool(config.get("use_wandb", True))
+
+
+def maybe_init_wandb(config):
+    if not wandb_enabled(config):
+        return
+    if wandb is None:
+        raise ImportError(
+            "use_wandb=True but wandb is not installed. "
+            "Set config['use_wandb'] = False to disable Weights & Biases logging."
+        )
+    wandb.init(entity="eleftheriaklk-ucl", project="brian_test", config=config)
+
+
+def maybe_wandb_log(config, payload, **kwargs):
+    if wandb_enabled(config):
+        wandb.log(payload, **kwargs)
+
+
+def save_training_checkpoint(params, checkpoint_step, label="final"):
+    from flax.training import checkpoints
+
+    checkpoint_dir = Path(__file__).resolve().parent / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    saved_path = checkpoints.save_checkpoint(
+        ckpt_dir=str(checkpoint_dir),
+        target=params,
+        step=int(checkpoint_step),
+        overwrite=True,
+    )
+    print(
+        f"Saved {label} checkpoint to {saved_path} "
+        f"(dir={checkpoint_dir}, step={int(checkpoint_step)})"
+    )
+    return Path(saved_path)
+
+
+def reset_curriculum_batch(
+    env,
+    rng,
+    num_envs,
+    vision_radius,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    rng, env_rng = jax.random.split(rng)
+    reset_keys = jax.random.split(env_rng, num_envs)
+    env_obs, env_state = env.reset_batch(
+        reset_keys,
+        vision_radius=vision_radius,
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+    return rng, env_obs, env_state
+
+
+def sample_curriculum_anchor(
+    env,
+    rng,
+    vision_radius,
+    control_mode,
+    fixed_goal_position=UNSET_POSITION,
+    exclude_start_position=UNSET_POSITION,
+    max_attempts=512,
+):
+    for _ in range(max_attempts):
+        rng, sample_rng = jax.random.split(rng)
+        _, timestep = env.reset(
+            sample_rng,
+            vision_radius=vision_radius,
+            control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+        )
+        start_position = env.player_position(timestep)
+        if jnp.any(exclude_start_position < 0) or not bool(
+            jnp.all(start_position == exclude_start_position)
+        ):
+            return rng, env.goal_position(timestep), start_position
+    raise RuntimeError(
+        "Failed to sample a new curriculum start position. "
+        "This curriculum requires an environment with random starts, "
+        "for example 'Navix-Empty-Random-8x8-v0'."
+    )
+
+
+def collect_message_action_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    action_labels = ("turn_left", "turn_right", "forward")
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(
+        reset_rng,
+        vision_radius=vision_radius,
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    trace_lines = []
+    done = False
+    step_count = 0
+
+    while not bool(done) and step_count < max_steps:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_view = obs["local_view"][None, ...]
+        proprioception = obs["proprioception"][None, ...]
+
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
+        seer_carry, message, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+            target_images,
+        )
+        doer_carry, action_logits = doer.apply(
+            {"params": params["doer"]},
+            doer_carry,
+            local_view,
+            proprioception,
+            message,
+            menu_images[:, 0],
+        )
+
+        message_np = np.asarray(message[0]).round(3).tolist()
+        action = int(jnp.argmax(action_logits[0]))
+        action_label = action_labels[action] if action < len(action_labels) else str(action)
+        player_position = np.asarray(env.player_position(state)).tolist()
+        trace_lines.append(
+            f"t={step_count:02d} pos={player_position} msg={message_np} action={action_label}"
+        )
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            jnp.asarray(action, dtype=jnp.int32),
+            vision_radius=vision_radius,
+            control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
+        )
+        step_count += 1
+
+    final_status = "solved" if bool(done) and float(info["task_reward"]) > 0.0 else "stopped"
+    trace_lines.append(f"end={final_status} steps={step_count}")
+    return rng, trace_lines
+
+
+def print_communication_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+    label,
+):
+    rng, trace_rng = jax.random.split(rng)
+    rng, trace_lines = collect_message_action_trace(
+        env,
+        params,
+        trace_rng,
+        seer,
+        doer,
+        vision_radius,
+        max_steps,
+        control_mode,
+        fixed_goal_position,
+        fixed_start_position,
+    )
+    print(f"Communication trace ({label}):")
+    for line in trace_lines:
+        print(line)
+    return rng
+
+
+def evaluate_greedy_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    vision_radius,
+    max_steps,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(
+        reset_rng,
+        vision_radius=vision_radius,
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    done = False
+    step_count = 0
+    solved = False
+
+    while not bool(done) and step_count < max_steps:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_view = obs["local_view"][None, ...]
+        proprioception = obs["proprioception"][None, ...]
+
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
+        seer_carry, message, _, seer_nav_logits = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+            target_images,
+        )
+
+        if int(control_mode) == env.SEER_NAV_PHASE:
+            action = jnp.argmax(seer_nav_logits[0]).astype(jnp.int32)
+        else:
+            doer_carry, action_logits = doer.apply(
+                {"params": params["doer"]},
+                doer_carry,
+                local_view,
+                proprioception,
+                message,
+                menu_images[:, 0],
+            )
+            action = jnp.argmax(action_logits[0]).astype(jnp.int32)
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            action,
+            vision_radius=vision_radius,
+            control_mode=control_mode,
+            fixed_goal_position=fixed_goal_position,
+            fixed_start_position=fixed_start_position,
+        )
+        solved = solved or bool(done) and float(info["task_reward"]) > 0.0
+        step_count += 1
+
+    return rng, solved
+
+
+def initialize_two_doer_carry(doer, num_envs, num_doers, hidden_size):
+    flat_carry = doer.initialize_carry(batch_size=num_envs * num_doers, hidden_size=hidden_size)
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((num_envs, num_doers, hidden_size)),
+        flat_carry,
+    )
+
+
+def get_active_message_levels(fsq_levels, active_bits):
+    return tuple(fsq_levels[:active_bits])
+
+
+def format_two_doer_action(action: int) -> str:
+    action_labels = (
+        "stay",
+        "up",
+        "right",
+        "down",
+        "left",
+        "pick_0",
+        "pick_1",
+        "pick_2",
+        "pick_3",
+    )
+    return action_labels[action] if 0 <= action < len(action_labels) else str(action)
+
+
+def format_message_vector(message_values) -> str:
+    values = np.asarray(message_values, dtype=np.float32).reshape(-1)
+    return "[" + ", ".join(f"{float(v):.2f}" for v in values) + "]"
+
+
+def build_two_doer_trace_snapshot(step_count, state, messages, actions):
+    positions = np.asarray(state.positions).tolist()
+    message_np = np.asarray(messages[0], dtype=np.float32)
+    action_list = [int(action) for action in np.asarray(actions).tolist()]
+    action_names = [format_two_doer_action(action) for action in action_list]
+    target_items = np.asarray(state.target_items).tolist()
+    selected_slots = np.asarray(state.selected_option_idx).tolist()
+    attempts = np.asarray(state.selection_attempts).tolist()
+
+    def format_pick(agent_idx):
+        slot_idx = int(selected_slots[agent_idx])
+        if slot_idx < 0:
+            return "none"
+        return f"slot_{slot_idx}"
+
+    left_text = "\n".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_a={positions[0]}",
+            f"target_a=id_{target_items[0]}",
+            f"msg_a={format_message_vector(message_np[0])}",
+            f"act_a={action_names[0]}",
+            f"pick_a={format_pick(0)} ({attempts[0]})",
+        ]
+    )
+    right_text = "\n".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_b={positions[1]}",
+            f"target_b=id_{target_items[1]}",
+            f"msg_b={format_message_vector(message_np[1])}",
+            f"act_b={action_names[1]}",
+            f"pick_b={format_pick(1)} ({attempts[1]})",
+        ]
+    )
+    trace_line = " ".join(
+        [
+            f"t={step_count:02d}",
+            f"pos_a={positions[0]}",
+            f"pos_b={positions[1]}",
+            f"target_a=id_{target_items[0]}",
+            f"msg_a={format_message_vector(message_np[0])}",
+            f"act_a={action_names[0]}",
+            f"pick_a={format_pick(0)}",
+            f"target_b=id_{target_items[1]}",
+            f"msg_b={format_message_vector(message_np[1])}",
+            f"act_b={action_names[1]}",
+            f"pick_b={format_pick(1)}",
+        ]
+    )
+    return trace_line, left_text, right_text
+
+
+def annotate_two_doer_frame(frame, left_text, right_text):
+    panel_width = 240
+    background = (246, 244, 238)
+    border = (190, 186, 176)
+    text_color = (25, 25, 28)
+    font = ImageFont.load_default()
+    grid_image = Image.fromarray(frame)
+    canvas = Image.new(
+        "RGB",
+        (grid_image.width + 2 * panel_width, grid_image.height),
+        background,
+    )
+    canvas.paste(grid_image, (panel_width, 0))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle((0, 0, panel_width - 1, grid_image.height - 1), outline=border, width=1)
+    draw.rectangle(
+        (panel_width + grid_image.width, 0, canvas.width - 1, grid_image.height - 1),
+        outline=border,
+        width=1,
+    )
+    draw.multiline_text((12, 12), left_text, fill=text_color, font=font, spacing=4)
+    draw.multiline_text(
+        (panel_width + grid_image.width + 12, 12),
+        right_text,
+        fill=text_color,
+        font=font,
+        spacing=4,
+    )
+    return canvas
+
+
+def reset_two_doer_batch(env, rng, num_envs, fixed_positions):
+    rng, env_rng = jax.random.split(rng)
+    reset_keys = jax.random.split(env_rng, num_envs)
+    env_obs, env_state = env.reset_batch(reset_keys, fixed_positions=fixed_positions)
+    return rng, env_obs, env_state
+
+
+def sample_two_doer_curriculum_anchor(
+    env,
+    rng,
+    exclude_positions=UNSET_TWO_DOER_POSITIONS,
+    max_attempts=512,
+):
+    for _ in range(max_attempts):
+        rng, sample_rng = jax.random.split(rng)
+        _, state = env.reset(sample_rng)
+        if jnp.any(exclude_positions < 0) or not bool(jnp.all(state.positions == exclude_positions)):
+            return rng, state.positions
+    raise RuntimeError("Failed to sample a new two-doer curriculum start configuration.")
+
+
+def _run_two_doer_greedy_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    max_steps,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+    capture_trace=False,
+):
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(reset_rng, fixed_positions=fixed_positions)
+
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = initialize_two_doer_carry(doer, num_envs=1, num_doers=env.num_doers, hidden_size=128)
+    done = False
+    success = False
+    step_count = 0
+    trace_lines = []
+
+    while not bool(done) and step_count < max_steps:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_views = obs["local_views"][None, ...]
+        proprioceptions = obs["proprioceptions"][None, ...]
+
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
+        seer_carry, messages, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+            target_images,
+        )
+        messages = hard_mask_inactive_message_bits(
+            messages,
+            active_bits=env.active_message_bits,
+        )
+
+        batch_size, num_doers = local_views.shape[:2]
+        flat_local_views = local_views.reshape((batch_size * num_doers,) + local_views.shape[2:])
+        flat_proprioceptions = proprioceptions.reshape(
+            (batch_size * num_doers,) + proprioceptions.shape[2:]
+        )
+        flat_messages = messages.reshape((batch_size * num_doers,) + messages.shape[2:])
+        flat_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size * num_doers,) + x.shape[2:]),
+            doer_carry,
+        )
+        next_flat_doer_carry, flat_logits = doer.apply(
+            {"params": params["doer"]},
+            flat_doer_carry,
+            flat_local_views,
+            flat_proprioceptions,
+            flat_messages,
+            menu_images.reshape((batch_size * num_doers,) + menu_images.shape[2:]),
+        )
+        doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
+            next_flat_doer_carry,
+        )
+        masked_logits = mask_pick_actions_until_menu_visible(
+            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
+            menu_images,
+            pick_only_phase=env.is_pick_object_phase,
+            pick_available=obs["pick_available"][None, ...],
+        )
+        actions = jnp.argmax(
+            masked_logits[0],
+            axis=-1,
+        ).astype(jnp.int32)
+
+        if capture_trace:
+            trace_line, _, _ = build_two_doer_trace_snapshot(
+                step_count,
+                state,
+                messages,
+                actions,
+            )
+            trace_lines.append(trace_line)
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            actions,
+            fixed_positions=fixed_positions,
+        )
+        success = success or bool(info["success"])
+        step_count += 1
+
+    if capture_trace:
+        final_status = "solved" if bool(info["success"]) else "stopped"
+        trace_lines.append(f"end={final_status} steps={step_count}")
+    return rng, success, trace_lines
+
+
+def evaluate_two_doer_greedy_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    max_steps,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+):
+    rng, success, _ = _run_two_doer_greedy_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        max_steps,
+        fixed_positions=fixed_positions,
+        capture_trace=False,
+    )
+    return rng, success
+
+
+def collect_two_doer_message_action_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    max_steps,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+):
+    rng, _, trace_lines = _run_two_doer_greedy_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        max_steps,
+        fixed_positions=fixed_positions,
+        capture_trace=True,
+    )
+    return rng, trace_lines
+
+
+def print_two_doer_communication_trace(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    max_steps,
+    label,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+):
+    rng, trace_rng = jax.random.split(rng)
+    rng, trace_lines = collect_two_doer_message_action_trace(
+        env,
+        params,
+        trace_rng,
+        seer,
+        doer,
+        max_steps,
+        fixed_positions,
+    )
+    print(f"Two-doer communication trace ({label}):")
+    for line in trace_lines:
+        print(line)
+    return rng
+
+
+def flatten_message_codes(message_batch, fsq_levels):
+    levels = np.asarray(fsq_levels, dtype=np.int32)
+    multipliers = np.ones_like(levels)
+    for idx in range(len(levels) - 2, -1, -1):
+        multipliers[idx] = multipliers[idx + 1] * levels[idx + 1]
+
+    messages = np.rint(np.asarray(message_batch)).astype(np.int32)
+    messages = np.clip(messages, 0, levels - 1)
+    return (messages * multipliers).sum(axis=-1).astype(np.int32).reshape(-1)
+
+
+def compute_message_stats(message_batch, fsq_levels):
+    message_codes = flatten_message_codes(message_batch, fsq_levels)
+    num_codes = int(np.prod(np.asarray(fsq_levels, dtype=np.int32)))
+    counts = np.bincount(message_codes, minlength=num_codes).astype(np.float32)
+    total = max(int(counts.sum()), 1)
+    probs = counts / float(total)
+    nonzero_probs = probs[probs > 0.0]
+    entropy = float(-(nonzero_probs * np.log(nonzero_probs)).sum()) if nonzero_probs.size else 0.0
+    max_entropy = float(np.log(num_codes)) if num_codes > 1 else 0.0
+    normalized_entropy = entropy / max_entropy if max_entropy > 0.0 else 0.0
+    unique_codes = int((counts > 0).sum())
+    return {
+        "message_codes": message_codes,
+        "message_code_probs": probs,
+        "rollout_message_entropy": entropy,
+        "rollout_message_entropy_normalized": normalized_entropy,
+        "rollout_message_unique_codes": unique_codes,
+        "rollout_message_num_codes": num_codes,
+    }
+
+
+def log_curriculum_visualization(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    config,
+    update,
+    phase_label,
+    vision_radius,
+    control_mode,
+    fixed_goal_position,
+    fixed_start_position,
+):
+    viz_path = Path(config["visualize_dir"]) / f"{phase_label}_{update:05d}.gif"
+    output_path, solved = visualize_episode(
+        env,
+        params,
+        rng,
+        seer,
+        doer,
+        filename=str(viz_path),
+        vision_radius=vision_radius,
+        max_steps=config["visualize_max_steps"],
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+    if wandb_enabled(config):
+        maybe_wandb_log(
+            config,
+            {
+                "curriculum_reset_episode": wandb.Video(str(output_path), format="gif"),
+                "curriculum_reset_episode_solved": int(solved),
+            },
+            commit=False,
+        )
+
+
+def save_two_doer_initial_visualization(env, state, config):
+    output_path = Path(config["visualize_dir"]) / "two_doer_initial_layout.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame = env.render(state)
+    Image.fromarray(frame).save(output_path)
+    if wandb_enabled(config):
+        maybe_wandb_log(
+            config,
+            {
+                "two_doer_initial_layout": wandb.Image(str(output_path)),
+                "two_doer_initial_layout_step": 0,
+            },
+            commit=True,
+        )
+    print(f"Initial two-doer layout saved to {output_path}")
+    return output_path
+
+
+def print_two_doer_start_positions_banner(fixed_positions, label="TWO-DOER STARTS"):
+    positions_np = np.asarray(fixed_positions).tolist()
+    print("")
+    print("=" * 72)
+    print(label)
+    print(
+        f"Doer A: ({positions_np[0][0]}, {positions_np[0][1]}) | "
+        f"Doer B: ({positions_np[1][0]}, {positions_np[1][1]})"
+    )
+    print("=" * 72)
+    print("")
+
+
+def print_two_doer_perception_level_banner(level, label="TWO-DOER PERCEPTION LEVEL"):
+    print("")
+    print("=" * 72)
+    print(label)
+    print(f"doer_perception_level={level}")
+    print("=" * 72)
+    print("")
+
+
+def print_two_doer_selection_level_banner(level, env, label="TWO-DOER SELECTION LEVEL"):
+    if int(level) == 1:
+        description = (
+            "Pick_Object: doers are frozen at goal tiles, only object picks are allowed, "
+            f"active_msg_bits={env.active_message_bits}, first_pick_only=1, "
+            f"pick_object_listen_steps={env.pick_object_listen_steps}"
+        )
+    else:
+        description = (
+            "Full_Training: normal starts, corridor crossing, and object selection; "
+            f"active_msg_bits={env.active_message_bits}, first_pick_only=1"
+        )
+    print("")
+    print("=" * 72)
+    print(label)
+    print(f"PHASE {int(level)} | {env.phase_name}")
+    print(description)
+    print(
+        f"wrong_pick_penalties=({float(env.wrong_selection_penalty):.2f}, "
+        f"{float(env.wrong_selection_penalty_after_first):.2f}+)"
+    )
+    print("=" * 72)
+    print("")
+
+
+def log_two_doer_selection_level(config, level, update, event):
+    maybe_wandb_log(
+        config,
+        {
+            "two_doer_selection_level": int(level),
+            "two_doer_curriculum_phase": "Pick_Object" if int(level) == 1 else "Full_Training",
+            "two_doer_selection_level_event": str(event),
+            "two_doer_selection_level_step": int(update),
+        },
+    )
+
+
+def visualize_two_doer_episode(
+    env,
+    params,
+    rng,
+    seer,
+    doer,
+    config,
+    update,
+    fixed_positions=UNSET_TWO_DOER_POSITIONS,
+):
+    output_path = Path(config["visualize_dir"]) / f"two_doer_eval_{update:05d}.gif"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rng, reset_rng = jax.random.split(rng)
+    obs, state = env.reset(reset_rng, fixed_positions=fixed_positions)
+    seer_carry = seer.initialize_carry(batch_size=1, hidden_size=128)
+    doer_carry = initialize_two_doer_carry(
+        doer,
+        num_envs=1,
+        num_doers=env.num_doers,
+        hidden_size=128,
+    )
+    done = False
+    step_count = 0
+    success = False
+    frames = []
+    trace_lines = []
+    last_messages = None
+    last_actions = None
+
+    while not bool(done) and step_count < config["episode_max_steps"]:
+        global_map = obs["global_map"][None, ...]
+        symbolic_state = obs["symbolic_state"][None, ...]
+        local_views = obs["local_views"][None, ...]
+        proprioceptions = obs["proprioceptions"][None, ...]
+
+        target_images = obs["target_images"][None, ...]
+        menu_images = obs["menu_images"][None, ...]
+
+        seer_carry, messages, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            global_map,
+            symbolic_state,
+            target_images,
+        )
+        messages = hard_mask_inactive_message_bits(
+            messages,
+            active_bits=env.active_message_bits,
+        )
+
+        batch_size, num_doers = local_views.shape[:2]
+        flat_local_views = local_views.reshape((batch_size * num_doers,) + local_views.shape[2:])
+        flat_proprioceptions = proprioceptions.reshape(
+            (batch_size * num_doers,) + proprioceptions.shape[2:]
+        )
+        flat_messages = messages.reshape((batch_size * num_doers,) + messages.shape[2:])
+        flat_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size * num_doers,) + x.shape[2:]),
+            doer_carry,
+        )
+        next_flat_doer_carry, flat_logits = doer.apply(
+            {"params": params["doer"]},
+            flat_doer_carry,
+            flat_local_views,
+            flat_proprioceptions,
+            flat_messages,
+            menu_images.reshape((batch_size * num_doers,) + menu_images.shape[2:]),
+        )
+        doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((batch_size, num_doers) + x.shape[1:]),
+            next_flat_doer_carry,
+        )
+        masked_logits = mask_pick_actions_until_menu_visible(
+            flat_logits.reshape((batch_size, num_doers, flat_logits.shape[-1])),
+            menu_images,
+            pick_only_phase=env.is_pick_object_phase,
+            pick_available=obs["pick_available"][None, ...],
+        )
+        actions = jnp.argmax(
+            masked_logits[0],
+            axis=-1,
+        ).astype(jnp.int32)
+        trace_line, left_text, right_text = build_two_doer_trace_snapshot(
+            step_count,
+            state,
+            messages,
+            actions,
+        )
+        frame = env.render(state)
+        frames.append(annotate_two_doer_frame(frame, left_text, right_text))
+        trace_lines.append(trace_line)
+        last_messages = messages
+        last_actions = actions
+
+        rng, step_rng = jax.random.split(rng)
+        obs, state, _, done, info = env.step(
+            step_rng,
+            state,
+            actions,
+            fixed_positions=fixed_positions,
+        )
+        success = success or bool(info["success"])
+        step_count += 1
+
+    final_status = "solved" if success else "stopped"
+    trace_lines.append(f"end={final_status} steps={step_count}")
+    if frames and last_messages is not None and last_actions is not None:
+        _, left_text, right_text = build_two_doer_trace_snapshot(
+            step_count,
+            state,
+            last_messages,
+            last_actions,
+        )
+        left_text = f"{left_text}\nfinal=1"
+        right_text = f"{right_text}\nfinal=1"
+        frames.append(annotate_two_doer_frame(env.render(state), left_text, right_text))
+
+    if frames:
+        frames[0].save(
+            output_path,
+            save_all=True,
+            append_images=frames[1:],
+            duration=150,
+            loop=0,
+        )
+        if wandb_enabled(config):
+            maybe_wandb_log(
+                config,
+                {
+                    "two_doer_eval_episode": wandb.Video(str(output_path), format="gif"),
+                    "two_doer_eval_episode_solved": int(success),
+                    "two_doer_eval_episode_step": int(update),
+                },
+                commit=True,
+            )
+        print(f"Two-doer eval episode saved to {output_path}")
+        print(f"Two-doer communication trace (visualize_{update}):")
+        for line in trace_lines:
+            print(line)
+
+    return rng, output_path, success, trace_lines
+
+
+def run_two_doer_training(config):
+    rng = jax.random.PRNGKey(config["seed"])
+    rng, seer_init_rng, doer_init_rng, critic_init_rng, reset_rng = jax.random.split(rng, 5)
+    initial_selection_phase_level = (
+        config["two_doer_selection_level_start"]
+        if config["use_pick_object_curriculum"]
+        else 2
+    )
+
+    env = TwoDoerBottleneckEnv(
+        grid_height=config["grid_height"],
+        grid_width=config["grid_width"],
+        local_view_size=config["local_view_size"],
+        corridor_length=config["corridor_length"],
+        max_steps=config["episode_max_steps"],
+        progress_reward_scale=config["progress_reward_scale"],
+        goal_reward=config["goal_reward"],
+        wrong_selection_penalty=config["wrong_selection_penalty"],
+        wrong_selection_penalty_after_first=config["wrong_selection_penalty_after_first"],
+        step_penalty=config["step_penalty"],
+        wall_penalty=config["wall_penalty"],
+        collision_penalty=config["collision_penalty"],
+        doer_perception_level=config["doer_perception_level"],
+        selection_phase_level=initial_selection_phase_level,
+        max_selection_attempts=config["two_doer_max_selection_attempts"],
+        pick_object_max_steps=config["pick_object_max_steps"],
+        pick_object_listen_steps=config["pick_object_listen_steps"],
+    )
+    curriculum_active = (
+        config["use_two_doer_start_curriculum"]
+        and not config["two_doer_random_starts_only"]
+    )
+    current_start_success_streak = 0
+    mastered_start_positions = 0
+    fixed_positions = UNSET_TWO_DOER_POSITIONS
+    if curriculum_active:
+        rng, fixed_positions = sample_two_doer_curriculum_anchor(env, rng)
+        print_two_doer_start_positions_banner(fixed_positions, label="INITIAL TWO-DOER STARTS")
+    print_two_doer_perception_level_banner(
+        env.doer_perception_level,
+        label="INITIAL TWO-DOER PERCEPTION LEVEL",
+    )
+    print_two_doer_selection_level_banner(
+        env.selection_phase_level,
+        env,
+        label="INITIAL TWO-DOER SELECTION LEVEL",
+    )
+    log_two_doer_selection_level(
+        config,
+        env.selection_phase_level,
+        0,
+        "initial",
+    )
+
+    rng, env_obs, env_state = reset_two_doer_batch(
+        env,
+        rng,
+        config["num_envs"],
+        fixed_positions,
+    )
+    save_two_doer_initial_visualization(env, jax.tree_util.tree_map(lambda x: x[0], env_state), config)
+
+    seer = Seer(
+        fsq_levels=config["fsq_levels"],
+        num_actions=env.num_actions,
+        num_message_heads=env.num_doers,
+    )
+    doer = Doer(fsq_levels=config["fsq_levels"], num_actions=env.num_actions)
+    critic = GlobalCritic(output_dim=1)
+
+    dummy_map = env_obs["global_map"][:1]
+    dummy_sym = env_obs["symbolic_state"][:1]
+    dummy_local = env_obs["local_views"][:1, 0]
+    dummy_prop = env_obs["proprioceptions"][:1, 0]
+    dummy_msg = jnp.zeros((1, len(config["fsq_levels"])))
+    init_seer_carry = seer.initialize_carry(1, 128)
+    init_doer_carry = doer.initialize_carry(1, 128)
+
+    dummy_target = env_obs["target_images"][:1]
+    dummy_menu = env_obs["menu_images"][:1, 0]
+    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym, dummy_target)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg, dummy_menu)["params"]
+    critic_params = critic.init(critic_init_rng, dummy_map)["params"]
+
+    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+    doer_carry = initialize_two_doer_carry(
+        doer,
+        num_envs=config["num_envs"],
+        num_doers=env.num_doers,
+        hidden_size=128,
+    )
+    params = {"seer": seer_params, "doer": doer_params, "critic": critic_params}
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adam(learning_rate=config["learning_rate"], eps=1e-5),
+    )
+    actor_state = TrainState.create(
+        apply_fn=None,
+        params={"seer": seer_params, "doer": doer_params},
+        tx=tx,
+    )
+    critic_state = TrainState.create(
+        apply_fn=critic.apply,
+        params=critic_params,
+        tx=tx,
+    )
+    step_fn = make_two_doer_rollout_step(
+        env,
+        seer.apply,
+        doer.apply,
+        critic.apply,
+    )
+    num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
+
+    print(
+        "Starting training... "
+        f"(task=two_doer_bottleneck, num_doers={env.num_doers}, fsq_levels={config['fsq_levels']}, "
+        f"curriculum={'fixed_starts' if curriculum_active else 'random_starts'})"
+    )
+
+    for update in range(num_updates):
+        rng, rollout_rng = jax.random.split(rng)
+        init_seer_carry = seer_carry
+        init_doer_carry = doer_carry
+
+        final_runner_state, trajectory_batch = generate_two_doer_trajectory_and_gae(
+            params,
+            rollout_rng,
+            env_obs,
+            env_state,
+            seer_carry,
+            doer_carry,
+            fixed_positions,
+            config["num_steps"],
+            step_fn,
+            critic.apply,
+        )
+        params, seer_carry, doer_carry, env_state, env_obs, _, _ = final_runner_state
+
+        rng, actor_rng, critic_rng = jax.random.split(rng, 3)
+        batched_trajectory = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1),
+            trajectory_batch,
+        )
+        actor_state, actor_metrics = update_actor_two_doer(
+            actor_state,
+            batched_trajectory,
+            init_seer_carry,
+            init_doer_carry,
+            seer.apply,
+            doer.apply,
+            actor_rng,
+            get_active_message_levels(config["fsq_levels"], env.active_message_bits),
+            env.active_message_bits,
+            env.is_pick_object_phase,
+            jnp.asarray(config["seer_entropy_coef"], dtype=jnp.float32),
+        )
+        critic_state, critic_metrics = update_critic_two_doer(
+            critic_state,
+            batched_trajectory,
+            critic.apply,
+            critic_rng,
+        )
+        params["seer"] = actor_state.params["seer"]
+        params["doer"] = actor_state.params["doer"]
+        params["critic"] = critic_state.params
+
+        eventual_success_events = jnp.logical_and(
+            trajectory_batch.done,
+            trajectory_batch.eventual_success,
+        )
+        first_try_success_events = jnp.logical_and(
+            trajectory_batch.done,
+            trajectory_batch.first_try_success,
+        )
+        completed_episodes = trajectory_batch.done.astype(jnp.int32).sum()
+        rollout_num_eventual_successes = eventual_success_events.astype(jnp.int32).sum()
+        rollout_num_first_try_successes = first_try_success_events.astype(jnp.int32).sum()
+        eventual_success_rate = jnp.where(
+            completed_episodes > 0,
+            rollout_num_eventual_successes.astype(jnp.float32)
+            / completed_episodes.astype(jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        first_try_success_rate = jnp.where(
+            completed_episodes > 0,
+            rollout_num_first_try_successes.astype(jnp.float32)
+            / completed_episodes.astype(jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        total_valid_selections = trajectory_batch.valid_selection_count.sum()
+        total_correct_selections = trajectory_batch.correct_selection_count.sum()
+        selection_accuracy = jnp.where(
+            total_valid_selections > 0.0,
+            total_correct_selections / total_valid_selections,
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        active_message_levels = get_active_message_levels(config["fsq_levels"], env.active_message_bits)
+        message_stats = compute_message_stats(
+            trajectory_batch.message[..., :env.active_message_bits],
+            active_message_levels,
+        )
+        rng, cic_rng = jax.random.split(rng)
+        cic_score = compute_two_doer_cic(
+            doer.apply,
+            params["doer"],
+            trajectory_batch,
+            init_doer_carry,
+            cic_rng,
+        )
+
+        if update % 10 == 0:
+            if wandb_enabled(config):
+                maybe_wandb_log(
+                    config,
+                    {
+                        "task_variant": config["task_variant"],
+                        "doer_perception_level": env.doer_perception_level,
+                        "two_doer_selection_level": env.selection_phase_level,
+                        "two_doer_curriculum_phase": env.phase_name,
+                        "active_message_bits": env.active_message_bits,
+                        "curriculum_fixed_starts": int(curriculum_active),
+                        "curriculum_eval_gate_passed": int(
+                            first_try_success_rate >= config["curriculum_rollout_success_threshold"]
+                        ),
+                        "mastered_start_positions": mastered_start_positions,
+                        "rollout_success_rate": first_try_success_rate,
+                        "eventual_success_rate": eventual_success_rate,
+                        "first_try_success_rate": first_try_success_rate,
+                        "team_reward": trajectory_batch.reward.mean(),
+                        "task_reward": trajectory_batch.task_reward.mean(),
+                        "individual_selection_reward": trajectory_batch.individual_selection_reward.mean(),
+                        "selection_accuracy": selection_accuracy,
+                        "valid_selection_count": total_valid_selections,
+                        "correct_selection_count": total_correct_selections,
+                        "progress_reward_doer_a": trajectory_batch.progress_reward_per_doer[..., 0].mean(),
+                        "progress_reward_doer_b": trajectory_batch.progress_reward_per_doer[..., 1].mean(),
+                        "step_penalty": trajectory_batch.step_penalty_component.mean(),
+                        "wall_penalty": trajectory_batch.wall_penalty_component.mean(),
+                        "collision_penalty": trajectory_batch.collision_penalty_component.mean(),
+                        "cic_score": cic_score,
+                        "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                        "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                        "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                        "seer_grad_norm": actor_metrics.get("seer_grad_norm", 0.0),
+                        "doer_grad_norm": actor_metrics.get("doer_grad_norm", 0.0),
+                        "message_distribution": wandb.Histogram(
+                            np.asarray(message_stats["message_codes"])
+                        ),
+                    }
+                )
+            print(
+                f"Update {update}/{num_updates} | "
+                f"Phase: {env.phase_name} | "
+                f"Curriculum: {'fixed' if curriculum_active else 'random'} | "
+                f"EvalGate: {int(first_try_success_rate >= config['curriculum_rollout_success_threshold'])} | "
+                f"Mastered: {mastered_start_positions}/"
+                f"{config['two_doer_required_start_positions']} | "
+                f"SuccessRate: {float(first_try_success_rate):.3f} | "
+                f"Eventual: {float(eventual_success_rate):.3f} | "
+                f"SelAcc: {float(selection_accuracy):.3f} | "
+                f"Sel: {float(total_correct_selections):.0f}/{float(total_valid_selections):.0f} | "
+                f"TeamReward: {trajectory_batch.reward.mean():.3f} | "
+                f"Task: {trajectory_batch.task_reward.mean():.3f} | "
+                f"IndSel: {trajectory_batch.individual_selection_reward.mean():.3f} | "
+                f"ProgA: {trajectory_batch.progress_reward_per_doer[..., 0].mean():.3f} | "
+                f"ProgB: {trajectory_batch.progress_reward_per_doer[..., 1].mean():.3f} | "
+                f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
+                f"Wall: {trajectory_batch.wall_penalty_component.mean():.3f} | "
+                f"Coll: {trajectory_batch.collision_penalty_component.mean():.3f} | "
+                f"MsgH: {message_stats['rollout_message_entropy_normalized']:.3f} | "
+                f"MsgUsed: {message_stats['rollout_message_unique_codes']}/"
+                f"{message_stats['rollout_message_num_codes']} | "
+                f"CIC: {float(cic_score):.3f} | "
+                f"SeerGrad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
+                f"DoerGrad: {actor_metrics.get('doer_grad_norm', 0.0):.4f}"
+            )
+
+        if (
+            config["use_pick_object_curriculum"]
+            and
+            env.selection_phase_level == 1
+            and float(first_try_success_rate) > config["two_doer_selection_level_advance_threshold"]
+        ):
+            env.set_selection_phase_level(2)
+            step_fn = make_two_doer_rollout_step(
+                env,
+                seer.apply,
+                doer.apply,
+                critic.apply,
+            )
+            print_two_doer_selection_level_banner(
+                env.selection_phase_level,
+                env,
+                label="ADVANCED TWO-DOER SELECTION LEVEL",
+            )
+            log_two_doer_selection_level(
+                config,
+                env.selection_phase_level,
+                update,
+                "advanced",
+            )
+            rng, env_obs, env_state = reset_two_doer_batch(
+                env,
+                rng,
+                config["num_envs"],
+                fixed_positions,
+            )
+            seer_carry = seer.initialize_carry(config["num_envs"], 128)
+            doer_carry = initialize_two_doer_carry(
+                doer,
+                num_envs=config["num_envs"],
+                num_doers=env.num_doers,
+                hidden_size=128,
+            )
+
+        if update > 0 and update % config["eval_every"] == 0:
+            gate_passed = bool(
+                float(first_try_success_rate) >= config["curriculum_rollout_success_threshold"]
+            )
+            greedy_solved = False
+            if gate_passed:
+                rng, greedy_solved, trace_lines = _run_two_doer_greedy_episode(
+                    env,
+                    params,
+                    rng,
+                    seer,
+                    doer,
+                    config["episode_max_steps"],
+                    fixed_positions=fixed_positions,
+                    capture_trace=True,
+                )
+                print(
+                    f"Greedy eval @ {update}: "
+                    f"gate_passed=1 solved={int(greedy_solved)}"
+                )
+                print(f"Two-doer communication trace (update_{update}):")
+                for line in trace_lines:
+                    print(line)
+            else:
+                print(
+                    f"Greedy eval @ {update}: "
+                    f"gate_passed=0 skipped "
+                    f"(rollout_success_rate={float(first_try_success_rate):.3f})"
+                )
+            maybe_wandb_log(
+                config,
+                {
+                    "curriculum_eval_gate_passed": int(gate_passed),
+                    "greedy_episode_solved": int(greedy_solved),
+                }
+            )
+
+            if curriculum_active:
+                if greedy_solved:
+                    mastered_start_positions += 1
+                    previous_fixed_positions = fixed_positions
+
+                    if mastered_start_positions >= config["two_doer_required_start_positions"]:
+                        curriculum_active = False
+                        fixed_positions = UNSET_TWO_DOER_POSITIONS
+                        if env.doer_perception_level < config["max_doer_perception_level"]:
+                            env.doer_perception_level = config["max_doer_perception_level"]
+                            config["doer_perception_level"] = env.doer_perception_level
+                            print_two_doer_perception_level_banner(
+                                env.doer_perception_level,
+                                label="NEW TWO-DOER PERCEPTION LEVEL",
+                            )
+                        print("")
+                        print("=" * 72)
+                        print("TWO-DOER CURRICULUM COMPLETE: random starts enabled")
+                        print("=" * 72)
+                        print("")
+                    else:
+                        rng, fixed_positions = sample_two_doer_curriculum_anchor(
+                            env,
+                            rng,
+                            exclude_positions=previous_fixed_positions,
+                        )
+                        print_two_doer_start_positions_banner(
+                            fixed_positions,
+                            label="NEW TWO-DOER STARTS",
+                        )
+
+                    rng, env_obs, env_state = reset_two_doer_batch(
+                        env,
+                        rng,
+                        config["num_envs"],
+                        fixed_positions,
+                    )
+                    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                    doer_carry = initialize_two_doer_carry(
+                        doer,
+                        num_envs=config["num_envs"],
+                        num_doers=env.num_doers,
+                        hidden_size=128,
+                    )
+                else:
+                    current_start_success_streak = 0
+
+        if update > 0 and update % config["visualize_every"] == 0:
+            rng, _, viz_success, _ = visualize_two_doer_episode(
+                env,
+                params,
+                rng,
+                seer,
+                doer,
+                config,
+                update,
+                fixed_positions=fixed_positions,
+            )
+            if float(first_try_success_rate) >= 1.0:
+                global_step = int((update + 1) * config["num_steps"] * config["num_envs"])
+                print("")
+                print("=" * 72)
+                print(
+                    "SUCCESSFUL: first_try_success_rate reached 1.000 after visualization "
+                    f"at global_step={global_step}"
+                )
+                print("=" * 72)
+                print("")
+                if not viz_success:
+                    print(
+                        "Visualization episode did not solve despite first_try_success_rate=1.000; "
+                        "continuing with checkpoint save and termination."
+                    )
+                probe_and_save_codebook(
+                    env,
+                    params,
+                    rng,
+                    doer,
+                    config["fsq_levels"],
+                    checkpoint_step=global_step,
+                )
+                return
+
+    final_global_step = int(num_updates * config["num_steps"] * config["num_envs"])
+    print("")
+    print("=" * 72)
+    print(
+        "TWO-DOER TRAINING COMPLETE: saving final checkpoint and codebook "
+        f"at global_step={final_global_step}"
+    )
+    print("=" * 72)
+    print("")
+    probe_and_save_codebook(
+        env,
+        params,
+        rng,
+        doer,
+        config["fsq_levels"],
+        checkpoint_step=final_global_step,
+    )
+
+
+def main():
+    # 1. Configuration and Logging
+    config = {
+        "task_variant": "two_doer_bottleneck",
+        "learning_rate": 3e-4,
+        "num_envs": 16,
+        "num_steps": 64,
+        "total_timesteps": 30_000_000,
+        "env_id": "Navix-Empty-Random-8x8-v0",
+        "fsq_levels": [2, 2, 2, 2],
+        "seed": 42,
+        "grid_height": 10,
+        "grid_width": 12,
+        "local_view_size": 3,
+        "corridor_length": 3,
+        "episode_max_steps": 48,
+        "goal_reward": 2.0,
+        "follow_reward_scale": 0.1,
+        "progress_reward_scale": 0.1,
+        "wrong_selection_penalty": 0.15,
+        "wrong_selection_penalty_after_first": 0.30,
+        "cic_coef": 0.01,
+        "seer_entropy_coef": 0.05,
+        "doer_perception_level": 2,
+        "use_pick_object_curriculum": True,
+        "two_doer_selection_level_start": 1,
+        "two_doer_selection_level_advance_threshold": 0.90,
+        "two_doer_max_selection_attempts": 4,
+        "pick_object_max_steps": 8,
+        "pick_object_listen_steps": 1,
+        "max_doer_perception_level": 3,
+        "curriculum_success_streak": 3,
+        "curriculum_eval_every": 25,
+        "eval_every": 300,
+        "curriculum_rollout_success_threshold": 0.97,
+        "visualize_every": 1000,
+        "use_wandb": True,
+        "use_two_doer_start_curriculum": False,
+        "two_doer_random_starts_only": True,
+        "two_doer_required_start_positions": 3,
+        "use_seer_nav_phase": False,
+        "seer_required_start_positions": 5,
+        "communication_start_positions_per_level": 5,
+        "release_goal_after_max_level": True,
+        "min_start_distance": 1.0,
+        "step_penalty": 0.03,
+        "bump_penalty": 0.1,
+        "wall_penalty": 0.02,
+        "collision_penalty": 0.05,
+        "visualize_max_steps": 30,
+        "visualize_dir": "artifacts/episodes",
+    }
+    
+    maybe_init_wandb(config)
+
+    print(f"backend: {jax.default_backend()}")
+    print(f"devices: {jax.devices()}")
+
+    if config["task_variant"] == "two_doer_bottleneck":
+        run_two_doer_training(config)
+        return
+    
+    # 2. PRNG Key Initialization
+    # JAX requires explicit, rigorous management of randomness
+    rng = jax.random.PRNGKey(config["seed"])
+    rng, seer_init_rng, doer_init_rng, critic_init_rng, env_rng = jax.random.split(rng, 5)
+
+    # 3. Environment Instantiation
+    raw_env = nx.make(config["env_id"])
+    env = NavixGridWrapper(
+        raw_env,
+        progress_reward_scale=config["progress_reward_scale"],
+        min_start_distance=config["min_start_distance"],
+        step_penalty=config["step_penalty"],
+        bump_penalty=config["bump_penalty"],
+        doer_perception_level=config["doer_perception_level"],
+    )
+    seer_nav_mode = jnp.array(env.SEER_NAV_PHASE, dtype=jnp.int32)
+    communication_mode = jnp.array(env.COMMUNICATION_PHASE, dtype=jnp.int32)
+    control_mode = (
+        seer_nav_mode
+        if config["use_seer_nav_phase"]
+        else communication_mode
+    )
+
+    # 4. Initial Environment Reset
+    fixed_goal_position = UNSET_POSITION
+    fixed_start_position = UNSET_POSITION
+    rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
+        env,
+        rng,
+        vision_radius=jnp.array(3.0),
+        control_mode=control_mode,
+    )
+    env.doer_perception_level = config["doer_perception_level"]
+    rng, env_obs, env_state = reset_curriculum_batch(
+        env,
+        rng,
+        config["num_envs"],
+        vision_radius=jnp.array(3.0),
+        control_mode=control_mode,
+        fixed_goal_position=fixed_goal_position,
+        fixed_start_position=fixed_start_position,
+    )
+
+    # 5. Network Instantiation
+    seer = Seer(fsq_levels=config["fsq_levels"])
+    doer = Doer(fsq_levels=config["fsq_levels"], num_actions=env.num_actions)
+    critic = GlobalCritic()
+
+    # 6. Parameter Initialization (Dummy Forward Passes)
+    # We must pass data of the correct shape to initialize the Flax parameters
+    dummy_map = env_obs["global_map"][:1]
+    dummy_sym = env_obs["symbolic_state"][:1]
+    dummy_local = env_obs["local_view"][:1]
+    dummy_prop = env_obs["proprioception"][:1]
+    dummy_msg = jnp.zeros((1, len(config["fsq_levels"])))
+    
+    init_seer_carry = seer.initialize_carry(1, 128)
+    init_doer_carry = doer.initialize_carry(1, 128)
+
+    dummy_target = env_obs["target_images"][:1]
+    dummy_menu = env_obs["menu_images"][:1, 0]
+    seer_params = seer.init(seer_init_rng, init_seer_carry, dummy_map, dummy_sym, dummy_target)["params"]
+    doer_params = doer.init(doer_init_rng, init_doer_carry, dummy_local, dummy_prop, dummy_msg, dummy_menu)["params"]
+    critic_params = critic.init(critic_init_rng, dummy_map)["params"]
+
+    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+    doer_carry = doer.initialize_carry(config["num_envs"], 128)
+
+    # Group parameters for the execution loop
+    params = {"seer": seer_params, "doer": doer_params, "critic": critic_params}
+
+    # 6. Optimizer and TrainState Setup
+    # Optax provides the gradient transformation tools
+    tx = optax.chain(
+        optax.clip_by_global_norm(0.5),
+        optax.adam(learning_rate=config["learning_rate"], eps=1e-5)
+    )
+
+    # Since the Seer and Doer act cooperatively to generate the trajectory,
+    # we can conceptually treat them as a single "Actor" policy for the optimizer.
+    # In a more advanced setup, you might give them separate optimizers.
+    actor_state = TrainState.create(
+        apply_fn=None, # We use specific apply fns in the update step
+        params={"seer": seer_params, "doer": doer_params},
+        tx=tx
+    )
+    
+    critic_state = TrainState.create(
+        apply_fn=critic.apply,
+        params=critic_params,
+        tx=tx
+    )
+
+    step_fn = make_rollout_step(
+        env,
+        seer.apply,
+        doer.apply,
+        critic.apply,
+        follow_reward_scale=config["follow_reward_scale"],
+    )
+    current_start_success_streak = 0
+    seer_mastered_starts = 0
+    communication_mastered_starts = 0
+    goal_randomization_enabled = False
+
+    # 8. The Main Training Loop
+    num_updates = config["total_timesteps"] // (config["num_steps"] * config["num_envs"])
+    
+    print(
+        "Starting training... "
+        f"(phase={'seer_nav' if config['use_seer_nav_phase'] else 'communication'}, "
+        f"doer_perception_level={config['doer_perception_level']})"
+    )
+    for update in range(num_updates):
+        rng, rollout_rng = jax.random.split(rng)
+        
+        # Curriculums
+        vision_radius = jnp.clip(3.0 - 2.0 * (update / 1000.0), 1.0, 3.0)
+        seer_entropy_coef = jnp.clip(0.1 - 0.09 * (update / 1000.0), 0.01, 0.1)
+        
+        # A. Collect Trajectory
+        init_seer_carry = seer_carry
+        init_doer_carry = doer_carry
+        
+        final_runner_state, trajectory_batch = generate_trajectory_and_gae(
+            params,
+            rollout_rng,
+            env_obs,
+            env_state,
+            seer_carry,
+            doer_carry,
+            vision_radius,
+            control_mode,
+            fixed_goal_position,
+            fixed_start_position,
+            jnp.array(config["cic_coef"], dtype=jnp.float32),
+            config["num_steps"],
+            step_fn, critic.apply, doer.apply
+        )
+        
+        # Extract for next loop iteration
+        params, seer_carry, doer_carry, env_state, env_obs, _, _, _, _, _ = final_runner_state
+        
+        # B. Generalized Advantage Estimation (GAE)
+        # GAE is now calculated inside generate_trajectory_and_gae
+        
+        # C. Update Networks
+        rng, actor_rng, critic_rng = jax.random.split(rng, 3)
+        
+        batched_trajectory = jax.tree_util.tree_map(
+            lambda x: jnp.swapaxes(x, 0, 1),
+            trajectory_batch
+        )
+        batched_seer_carry = init_seer_carry
+        batched_doer_carry = init_doer_carry
+
+        actor_state, actor_metrics = update_actor(
+            actor_state, batched_trajectory, batched_seer_carry, batched_doer_carry, 
+            seer.apply,
+            doer.apply,
+            actor_rng,
+            control_mode,
+            tuple(config["fsq_levels"]),
+            seer_entropy_coef,
+        )
+        critic_state, critic_metrics = update_critic(
+            critic_state, batched_trajectory, critic.apply, critic_rng
+        )
+        
+        # Sync updated parameters back to the params dictionary for the next rollout
+        params["seer"] = actor_state.params["seer"]
+        params["doer"] = actor_state.params["doer"]
+        params["critic"] = critic_state.params
+
+        success_events = jnp.logical_and(
+            trajectory_batch.done,
+            trajectory_batch.task_reward > 0.0,
+        )
+        completed_episodes = trajectory_batch.done.astype(jnp.int32).sum()
+        rollout_num_successes = success_events.astype(jnp.int32).sum()
+        rollout_success_rate = jnp.where(
+            completed_episodes > 0,
+            rollout_num_successes.astype(jnp.float32)
+            / completed_episodes.astype(jnp.float32),
+            jnp.asarray(0.0, dtype=jnp.float32),
+        )
+        message_stats = compute_message_stats(trajectory_batch.message, config["fsq_levels"])
+        cic_score = float(trajectory_batch.cic_score.mean())
+        
+        # D. Logging
+        if update % 10 == 0:
+            if int(control_mode) == env.SEER_NAV_PHASE:
+                phase_label = "seer_nav"
+            elif goal_randomization_enabled:
+                phase_label = "communication_random_full"
+            else:
+                phase_label = "communication_random_start"
+            phase_indicators = {
+                "phase_seer_nav": int(phase_label == "seer_nav"),
+                "phase_communication_random_start": int(
+                    phase_label == "communication_random_start"
+                ),
+                "phase_communication_random_full": int(
+                    phase_label == "communication_random_full"
+                ),
+            }
+            if wandb_enabled(config):
+                maybe_wandb_log(
+                    config,
+                    {
+                        "phase_label": phase_label,
+                        "doer_perception_level": config["doer_perception_level"],
+                        "current_start_success_streak": current_start_success_streak,
+                        "rollout_success_rate": rollout_success_rate,
+                        "task_reward": trajectory_batch.task_reward.mean(),
+                        "progress_reward": trajectory_batch.progress_reward.mean(),
+                        "cic_score": cic_score,
+                        "rollout_message_entropy_normalized": message_stats["rollout_message_entropy_normalized"],
+                        "rollout_message_unique_codes": message_stats["rollout_message_unique_codes"],
+                        "critic_loss": critic_metrics.get("critic_loss", 0.0),
+                        "message_distribution": wandb.Histogram(
+                            np.asarray(message_stats["message_codes"])
+                        ),
+                        **phase_indicators,
+                    },
+                )
+            print(
+                f"Update {update}/{num_updates} | "
+                f"Phase: {phase_label} | "
+                f"Level: {config['doer_perception_level']} | "
+                f"Start: ({int(fixed_start_position[0])}, {int(fixed_start_position[1])}) | "
+                f"Goal: ({int(fixed_goal_position[0])}, {int(fixed_goal_position[1])}) | "
+                f"Streak: {current_start_success_streak} | "
+                f"SuccessRate: {float(rollout_success_rate):.3f} | "
+                f"Seer Reward: {trajectory_batch.reward[..., 0].mean():.3f} | "
+                f"Doer Reward: {trajectory_batch.reward[..., 1].mean():.3f} | "
+                f"Task: {trajectory_batch.task_reward.mean():.3f} | "
+                f"Progress: {trajectory_batch.progress_reward.mean():.3f} | "
+                f"Follow: {trajectory_batch.follow_reward.mean():.3f} | "
+                f"MsgH: {message_stats['rollout_message_entropy_normalized']:.3f} | "
+                f"MsgUsed: {message_stats['rollout_message_unique_codes']}/"
+                f"{message_stats['rollout_message_num_codes']} | "
+                f"Step: {trajectory_batch.step_penalty_component.mean():.3f} | "
+                f"Bump: {trajectory_batch.bump_penalty_component.mean():.3f} | "
+                f"Seer Grad: {actor_metrics.get('seer_grad_norm', 0.0):.4f} | "
+                f"Doer Grad: {actor_metrics.get('doer_grad_norm', 0.0):.4f} | "
+                f"CIC: {cic_score:.3f}"
+            )
+            
+        if update > 0 and update % config["curriculum_eval_every"] == 0:
+            rng, greedy_solved = evaluate_greedy_episode(
+                env,
+                params,
+                rng,
+                seer,
+                doer,
+                vision_radius,
+                config["visualize_max_steps"],
+                control_mode,
+                fixed_goal_position,
+                fixed_start_position,
+            )
+            current_start_success_streak = current_start_success_streak + 1 if greedy_solved else 0
+
+            if int(control_mode) == env.SEER_NAV_PHASE:
+                if current_start_success_streak >= config["curriculum_success_streak"]:
+                    current_start_success_streak = 0
+                    seer_mastered_starts += 1
+
+                    if seer_mastered_starts >= config["seer_required_start_positions"]:
+                        control_mode = communication_mode
+                        env.doer_perception_level = config["doer_perception_level"]
+                        communication_mastered_starts = 0
+                        print("")
+                        print("=" * 72)
+                        print("NEW PHASE: communication")
+                        print("=" * 72)
+                        print("")
+                        print("Seer navigation mastered on five starts; switching to communication phase.")
+                    else:
+                        print(
+                            f"Seer mastered start {seer_mastered_starts}/"
+                            f"{config['seer_required_start_positions']}."
+                        )
+
+                    rng, _, fixed_start_position = sample_curriculum_anchor(
+                        env,
+                        rng,
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position=fixed_goal_position,
+                        exclude_start_position=fixed_start_position,
+                    )
+                    rng, env_obs, env_state = reset_curriculum_batch(
+                        env,
+                        rng,
+                        config["num_envs"],
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+                    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                    doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                    print("")
+                    print("=" * 72)
+                    print(f"NEW RANDOM POSITION: {tuple(np.asarray(fixed_start_position).tolist())}")
+                    print("=" * 72)
+                    print("")
+                    rng, viz_rng = jax.random.split(rng)
+                    log_curriculum_visualization(
+                        env,
+                        params,
+                        viz_rng,
+                        seer,
+                        doer,
+                        config,
+                        update,
+                        "seer_nav_reset",
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+
+            elif int(control_mode) == env.COMMUNICATION_PHASE:
+                if current_start_success_streak >= config["curriculum_success_streak"]:
+                    current_start_success_streak = 0
+                    communication_mastered_starts += 1
+
+                    if (
+                        communication_mastered_starts
+                        >= config["communication_start_positions_per_level"]
+                    ):
+                        communication_mastered_starts = 0
+                        mastered_sublevel = config["doer_perception_level"]
+                        rng = print_communication_trace(
+                            env,
+                            params,
+                            rng,
+                            seer,
+                            doer,
+                            vision_radius,
+                            config["visualize_max_steps"],
+                            control_mode,
+                            fixed_goal_position,
+                            fixed_start_position,
+                            f"mastered_level_{mastered_sublevel}",
+                        )
+                        if config["doer_perception_level"] < config["max_doer_perception_level"]:
+                            config["doer_perception_level"] += 1
+                            env.doer_perception_level = config["doer_perception_level"]
+                            print("")
+                            print("=" * 72)
+                            print(
+                                "NEW DOER PERCEPTION LEVEL: "
+                                f"{config['doer_perception_level']}"
+                            )
+                            print("=" * 72)
+                            print("")
+                            print(
+                                f"Curriculum advanced to doer_perception_level="
+                                f"{config['doer_perception_level']}"
+                            )
+                        else:
+                            if (
+                                config["release_goal_after_max_level"]
+                                and not goal_randomization_enabled
+                            ):
+                                goal_randomization_enabled = True
+                                fixed_goal_position = UNSET_POSITION
+                                fixed_start_position = UNSET_POSITION
+                                print("")
+                                print("=" * 72)
+                                print("NEW SUBCASE: communication_random_full")
+                                print("=" * 72)
+                                print("")
+                                print(
+                                    "Max doer perception level mastered; releasing fixed goal "
+                                    "and continuing in fully random Empty-Random-8x8."
+                                )
+                            else:
+                                print("Max doer perception level reached; continuing with new starts.")
+
+                    if goal_randomization_enabled:
+                        previous_goal_position = fixed_goal_position
+                        rng, fixed_goal_position, fixed_start_position = sample_curriculum_anchor(
+                            env,
+                            rng,
+                            vision_radius,
+                            control_mode,
+                        )
+                        if not np.array_equal(
+                            np.asarray(previous_goal_position),
+                            np.asarray(fixed_goal_position),
+                        ):
+                            print("")
+                            print("=" * 72)
+                            print(f"NEW RANDOM GOAL: {tuple(np.asarray(fixed_goal_position).tolist())}")
+                            print("=" * 72)
+                            print("")
+                    else:
+                        rng, _, fixed_start_position = sample_curriculum_anchor(
+                            env,
+                            rng,
+                            vision_radius,
+                            control_mode,
+                            fixed_goal_position=fixed_goal_position,
+                            exclude_start_position=fixed_start_position,
+                        )
+                    rng, env_obs, env_state = reset_curriculum_batch(
+                        env,
+                        rng,
+                        config["num_envs"],
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+                    seer_carry = seer.initialize_carry(config["num_envs"], 128)
+                    doer_carry = doer.initialize_carry(config["num_envs"], 128)
+                    print("")
+                    print("=" * 72)
+                    print(f"NEW RANDOM POSITION: {tuple(np.asarray(fixed_start_position).tolist())}")
+                    print("=" * 72)
+                    print("")
+                    rng, viz_rng = jax.random.split(rng)
+                    phase_label = (
+                        "communication_random_full_reset"
+                        if goal_randomization_enabled
+                        else "communication_random_start_reset"
+                    )
+                    log_curriculum_visualization(
+                        env,
+                        params,
+                        viz_rng,
+                        seer,
+                        doer,
+                        config,
+                        update,
+                        phase_label,
+                        vision_radius,
+                        control_mode,
+                        fixed_goal_position,
+                        fixed_start_position,
+                    )
+
+    # END OF TRAINING
+    probe_and_save_codebook(
+        env,
+        params,
+        rng,
+        doer,
+        config["fsq_levels"],
+        checkpoint_step=config["total_timesteps"],
+    )
+
+def probe_and_save_codebook(env, params, rng, doer, fsq_levels, checkpoint_step):
+    import itertools
+    import json
+    
+    print("\n" + "="*72)
+    print("PROBING CODEBOOK AT END OF TRAINING")
+    print("="*72)
+    save_training_checkpoint(params, checkpoint_step, label="final")
+    
+    ranges = [list(range(l)) for l in fsq_levels]
+    words = list(itertools.product(*ranges))
+    
+    doer_carry = doer.initialize_carry(batch_size=1, hidden_size=128)
+    
+    dummy_local = jnp.zeros((1, 3, 3, 5), dtype=jnp.float32)
+    dummy_prop = jnp.zeros((1, env.num_doers + 3), dtype=jnp.float32)
+    rng, key = jax.random.split(rng)
+    bank = env._build_item_bank()
+    dummy_menu = jnp.stack([bank[0], bank[1], bank[2], bank[3]])[None, ...]
+    
+    codebook_mapping = {}
+    
+    for word in words:
+        message_array = jnp.array([word], dtype=jnp.float32)
+        _, action_logits = doer.apply(
+            {"params": params["doer"]},
+            doer_carry,
+            dummy_local,
+            dummy_prop,
+            message_array,
+            dummy_menu
+        )
+        action = int(jnp.argmax(action_logits[0]))
+        if action < 5:
+            action_desc = ["stay", "up", "right", "down", "left"][action]
+        else:
+            action_desc = f"pick_option_{action-5}"
+        
+        word_str = str(word)
+        codebook_mapping[word_str] = action_desc
+        print(f"Message {word_str} -> Doer Action: {action_desc}")
+        
+    with open("final_codebook.json", "w") as f:
+        json.dump(codebook_mapping, f, indent=4)
+    print("Codebook saved to final_codebook.json")
+
+if __name__ == "__main__":
+    main()

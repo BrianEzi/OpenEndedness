@@ -1,0 +1,706 @@
+import jax
+import jax.numpy as jnp
+import numpy as np
+from flax import struct
+
+UNSET_TWO_DOER_POSITIONS = jnp.full((2, 2), -1, dtype=jnp.int32)
+
+
+@struct.dataclass
+class TwoDoerState:
+    positions: jnp.ndarray
+    goals: jnp.ndarray
+    step_count: jnp.ndarray
+    done: jnp.ndarray
+    target_items: jnp.ndarray
+    shuffled_menus: jnp.ndarray
+    selected_correctly: jnp.ndarray
+    first_selection_correct: jnp.ndarray
+    has_selected: jnp.ndarray
+    has_arrived: jnp.ndarray
+    selection_attempts: jnp.ndarray
+    selected_option_idx: jnp.ndarray
+
+
+class TwoDoerBottleneckEnv:
+    """Two embodied Doers must swap sides through a single choke point."""
+
+    def __init__(
+        self,
+        grid_height: int = 10,
+        grid_width: int = 12,
+        local_view_size: int = 3,
+        corridor_length: int = 3,
+        max_steps: int = 48,
+        progress_reward_scale: float = 0.05,
+        goal_reward: float = 1.0,
+        arrival_reward: float = 0.5,
+        individual_selection_reward: float = 0.5,
+        wrong_selection_penalty: float = 0.15,
+        wrong_selection_penalty_after_first: float | None = None,
+        step_penalty: float = 0.03,
+        wall_penalty: float = 0.02,
+        collision_penalty: float = 0.05,
+        doer_perception_level: int = 2,
+        selection_phase_level: int = 1,
+        render_tile_size: int = 24,
+        max_selection_attempts: int = 4,
+        pick_object_max_steps: int = 8,
+        pick_object_listen_steps: int = 1,
+    ):
+        if grid_height < 8:
+            raise ValueError("grid_height must be >= 8.")
+        if grid_width < 10:
+            raise ValueError("grid_width must be >= 10.")
+        if local_view_size % 2 == 0:
+            raise ValueError("local_view_size must be odd.")
+        if corridor_length < 1:
+            raise ValueError("corridor_length must be >= 1.")
+        if grid_width - corridor_length - 2 < 4:
+            raise ValueError("grid_width is too small for the requested corridor_length.")
+
+        self.grid_height = int(grid_height)
+        self.grid_width = int(grid_width)
+        self.local_view_size = int(local_view_size)
+        self.corridor_length = int(corridor_length)
+        self.max_steps = int(max_steps)
+        self.progress_reward_scale = jnp.asarray(progress_reward_scale, dtype=jnp.float32)
+        self.goal_reward = jnp.asarray(goal_reward, dtype=jnp.float32)
+        self.arrival_reward = jnp.asarray(arrival_reward, dtype=jnp.float32)
+        self.individual_selection_reward = jnp.asarray(individual_selection_reward, dtype=jnp.float32)
+        self.wrong_selection_penalty = jnp.asarray(wrong_selection_penalty, dtype=jnp.float32)
+        if wrong_selection_penalty_after_first is None:
+            wrong_selection_penalty_after_first = wrong_selection_penalty * 2.0
+        self.wrong_selection_penalty_after_first = jnp.asarray(
+            wrong_selection_penalty_after_first,
+            dtype=jnp.float32,
+        )
+        self.step_penalty = jnp.asarray(step_penalty, dtype=jnp.float32)
+        self.wall_penalty = jnp.asarray(wall_penalty, dtype=jnp.float32)
+        self.collision_penalty = jnp.asarray(collision_penalty, dtype=jnp.float32)
+        self.doer_perception_level = int(doer_perception_level)
+        self._max_selection_attempts = int(max_selection_attempts)
+        self.pick_object_max_steps = int(pick_object_max_steps)
+        self.pick_object_listen_steps = int(pick_object_listen_steps)
+        self.selection_phase_level = 1
+        self.set_selection_phase_level(selection_phase_level)
+        self.render_tile_size = int(render_tile_size)
+        self.num_doers = 2
+        self._view_radius = self.local_view_size // 2
+        self._inner_width = self.grid_width - 2
+        self._room_width = (self._inner_width - self.corridor_length) // 2
+        self._extra_width = self._inner_width - self.corridor_length - 2 * self._room_width
+        self._left_room_start_col = 1
+        self._left_room_end_col = self._left_room_start_col + self._room_width
+        self._corridor_row = self.grid_height // 2
+        self._corridor_start_col = self._left_room_end_col
+        self._corridor_end_col = self._corridor_start_col + self.corridor_length
+        self._right_room_start_col = self._corridor_end_col
+        self._right_room_end_col = self._right_room_start_col + self._room_width
+        self._extra_wall_start_col = self._right_room_end_col
+        self._extra_wall_end_col = self.grid_width - 1
+        self._left_col = 1
+        self._right_col = self._right_room_end_col - 1
+        self._candidate_rows = jnp.asarray([1, 2, self.grid_height - 3, self.grid_height - 2], dtype=jnp.int32)
+        self._wall_map = self._build_wall_map()
+        self._goal_colors = jnp.asarray(
+            [
+                [0.90, 0.25, 0.25],
+                [0.20, 0.70, 0.30],
+            ],
+            dtype=jnp.float32,
+        )
+        self._agent_colors = jnp.asarray(
+            [
+                [0.85, 0.10, 0.10],
+                [0.05, 0.45, 0.95],
+            ],
+            dtype=jnp.float32,
+        )
+        self.item_bank = self._build_item_bank()
+
+    @property
+    def max_selection_attempts(self) -> int:
+        return self._max_selection_attempts
+
+    @property
+    def phase_name(self) -> str:
+        return "Pick_Object" if self.selection_phase_level == 1 else "Full_Training"
+
+    @property
+    def active_message_bits(self) -> int:
+        return 4
+
+    @property
+    def is_pick_object_phase(self) -> bool:
+        return self.selection_phase_level == 1
+
+    @property
+    def phase_max_steps(self) -> int:
+        return self.pick_object_max_steps if self.is_pick_object_phase else self.max_steps
+
+    def set_selection_phase_level(self, level: int) -> None:
+        level = int(level)
+        if level not in (1, 2):
+            raise ValueError(f"Unsupported selection_phase_level={level}. Use 1 or 2.")
+        self.selection_phase_level = level
+
+    @property
+    def num_actions(self) -> int:
+        # stay, up, right, down, left, pick_0, pick_1, pick_2, pick_3
+        return 9
+        
+    def _build_item_bank(self) -> jnp.ndarray:
+        colors = jnp.asarray([
+            [1.0, 0.2, 0.2],
+            [0.2, 1.0, 0.2],
+            [0.2, 0.4, 1.0],
+            [1.0, 1.0, 0.2],
+        ], dtype=jnp.float32)
+        shape0 = jnp.ones((5, 5), dtype=jnp.float32)
+        shape1 = jnp.zeros((5, 5), dtype=jnp.float32)
+        shape1 = shape1.at[2, 1:4].set(1.0)
+        shape1 = shape1.at[1:4, 2].set(1.0)
+        shape2 = jnp.zeros((5, 5), dtype=jnp.float32)
+        shape2 = shape2.at[1, 1].set(1.0)
+        shape2 = shape2.at[2, 2].set(1.0)
+        shape2 = shape2.at[3, 3].set(1.0)
+        shape2 = shape2.at[1, 3].set(1.0)
+        shape2 = shape2.at[3, 1].set(1.0)
+        shape3 = jnp.ones((5, 5), dtype=jnp.float32)
+        shape3 = shape3.at[1:4, 1:4].set(0.0)
+        shapes = jnp.stack([shape0, shape1, shape2, shape3])
+        bank = jnp.zeros((16, 5, 5, 3), dtype=jnp.float32)
+        for c in range(4):
+            for s in range(4):
+                bank = bank.at[c * 4 + s].set(shapes[s, :, :, None] * colors[c])
+        return bank
+
+    def _build_wall_map(self) -> jnp.ndarray:
+        wall_map = jnp.zeros((self.grid_height, self.grid_width), dtype=bool)
+        wall_map = wall_map.at[0, :].set(True)
+        wall_map = wall_map.at[-1, :].set(True)
+        wall_map = wall_map.at[:, 0].set(True)
+        wall_map = wall_map.at[:, -1].set(True)
+        corridor_cols = jnp.arange(self._corridor_start_col, self._corridor_end_col)
+        wall_map = wall_map.at[:, corridor_cols].set(True)
+        wall_map = wall_map.at[self._corridor_row, corridor_cols].set(False)
+        if self._extra_width > 0:
+            extra_cols = jnp.arange(self._extra_wall_start_col, self._extra_wall_end_col)
+            wall_map = wall_map.at[:, extra_cols].set(True)
+        return wall_map
+
+    @staticmethod
+    def _manhattan_distance(positions: jnp.ndarray, goals: jnp.ndarray) -> jnp.ndarray:
+        return jnp.abs(positions - goals).sum(axis=-1).astype(jnp.float32)
+
+    def _compose_global_map(self, state: TwoDoerState) -> jnp.ndarray:
+        global_map = jnp.zeros((self.grid_height, self.grid_width, 5), dtype=jnp.float32)
+        global_map = global_map.at[:, :, 0].set(self._wall_map.astype(jnp.float32))
+        global_map = global_map.at[state.positions[0, 0], state.positions[0, 1], 1].set(1.0)
+        global_map = global_map.at[state.positions[1, 0], state.positions[1, 1], 2].set(1.0)
+        global_map = global_map.at[state.goals[0, 0], state.goals[0, 1], 3].set(1.0)
+        global_map = global_map.at[state.goals[1, 0], state.goals[1, 1], 4].set(1.0)
+        return global_map
+
+    def _extract_local_views(self, global_map: jnp.ndarray, positions: jnp.ndarray) -> jnp.ndarray:
+        padded_map = jnp.pad(
+            global_map,
+            (
+                (self._view_radius, self._view_radius),
+                (self._view_radius, self._view_radius),
+                (0, 0),
+            ),
+        )
+
+        def slice_agent_view(position):
+            row = position[0]
+            col = position[1]
+            return jax.lax.dynamic_slice(
+                padded_map,
+                (row, col, 0),
+                (self.local_view_size, self.local_view_size, global_map.shape[-1]),
+            )
+
+        return jax.vmap(slice_agent_view)(positions)
+
+    def _split_observations(self, state: TwoDoerState):
+        global_map = self._compose_global_map(state)
+        full_local_views = self._extract_local_views(global_map, state.positions)
+        goals_reached = jnp.all(state.positions == state.goals, axis=-1).astype(jnp.float32)
+        agent_identity = jnp.eye(self.num_doers, dtype=jnp.float32)
+        position_features = jnp.stack(
+            [
+                state.positions[:, 0].astype(jnp.float32) / float(self.grid_height - 1),
+                state.positions[:, 1].astype(jnp.float32) / float(self.grid_width - 1),
+            ],
+            axis=-1,
+        )
+        proprioception_full = jnp.concatenate(
+            [position_features, agent_identity, goals_reached[:, None]],
+            axis=-1,
+        )
+        if self.doer_perception_level == 2:
+            local_views = jnp.zeros_like(full_local_views)
+            proprioceptions = proprioception_full
+        elif self.doer_perception_level == 3:
+            local_views = jnp.zeros_like(full_local_views)
+            proprioceptions = jnp.concatenate(
+                [
+                    jnp.zeros_like(position_features),
+                    agent_identity,
+                    goals_reached[:, None],
+                ],
+                axis=-1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported doer_perception_level={self.doer_perception_level}. "
+                "Use 2 or 3."
+            )
+        symbolic_state = jnp.concatenate(
+            [
+                jnp.asarray(
+                    [
+                        state.positions[0, 0] / float(self.grid_height - 1),
+                        state.positions[0, 1] / float(self.grid_width - 1),
+                        state.positions[1, 0] / float(self.grid_height - 1),
+                        state.positions[1, 1] / float(self.grid_width - 1),
+                    ],
+                    dtype=jnp.float32,
+                ),
+                jnp.asarray(
+                    [
+                        state.goals[0, 0] / float(self.grid_height - 1),
+                        state.goals[0, 1] / float(self.grid_width - 1),
+                        state.goals[1, 0] / float(self.grid_height - 1),
+                        state.goals[1, 1] / float(self.grid_width - 1),
+                    ],
+                    dtype=jnp.float32,
+                ),
+                goals_reached,
+                jnp.asarray(
+                    [state.step_count.astype(jnp.float32) / float(self.max_steps)],
+                    dtype=jnp.float32,
+                ),
+            ],
+            axis=0,
+        )
+        
+        target_images = self.item_bank[state.target_items]
+        menu_images = self.item_bank[state.shuffled_menus]
+        menu_images = jnp.where(goals_reached[:, None, None, None, None], menu_images, 0.0)
+        pick_available = jnp.logical_and(
+            goals_reached.astype(bool),
+            jnp.logical_or(
+                jnp.asarray(not self.is_pick_object_phase),
+                state.step_count >= self.pick_object_listen_steps,
+            ),
+        )
+
+        return {
+            "global_map": global_map,
+            "symbolic_state": symbolic_state,
+            "local_views": local_views,
+            "proprioceptions": proprioceptions,
+            "target_images": target_images,
+            "menu_images": menu_images,
+            "pick_available": pick_available,
+        }
+
+    def _goals_from_positions(self, positions: jnp.ndarray) -> jnp.ndarray:
+        return jnp.asarray(
+            [
+                [positions[0, 0], self._right_col],
+                [positions[1, 0], self._left_col],
+            ],
+            dtype=jnp.int32,
+        )
+
+    def reset(
+        self,
+        key: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        row_key_a, row_key_b = jax.random.split(key)
+        row_a = self._candidate_rows[jax.random.randint(row_key_a, (), 0, self._candidate_rows.shape[0])]
+        row_b = self._candidate_rows[jax.random.randint(row_key_b, (), 0, self._candidate_rows.shape[0])]
+        sampled_positions = jnp.asarray(
+            [
+                [row_a, self._left_col],
+                [row_b, self._right_col],
+            ],
+            dtype=jnp.int32,
+        )
+        start_positions = jnp.where(
+            jnp.all(fixed_positions >= 0),
+            fixed_positions.astype(jnp.int32),
+            sampled_positions,
+        )
+        phase_goals = self._goals_from_positions(start_positions)
+        positions = jnp.where(
+            self.is_pick_object_phase,
+            phase_goals,
+            start_positions,
+        )
+        goals = jnp.where(
+            self.is_pick_object_phase,
+            positions,
+            phase_goals,
+        )
+        
+        key_target_a, key_target_b, key_menu_a, key_menu_b = jax.random.split(key, 4)
+        target_a = jax.random.randint(key_target_a, (), 0, 16)
+        target_b = jax.random.randint(key_target_b, (), 0, 16)
+        
+        def make_menu(rng_key, target):
+            p = jnp.where(jnp.arange(16) == target, 0.0, 1.0 / 15.0)
+            distractors = jax.random.choice(rng_key, jnp.arange(16), shape=(3,), replace=False, p=p)
+            menu = jnp.concatenate([jnp.array([target]), distractors])
+            _, shuffle_key = jax.random.split(rng_key)
+            return jax.random.permutation(shuffle_key, menu)
+            
+        menu_a = make_menu(key_menu_a, target_a)
+        menu_b = make_menu(key_menu_b, target_b)
+        
+        state = TwoDoerState(
+            positions=positions,
+            goals=goals,
+            step_count=jnp.asarray(0, dtype=jnp.int32),
+            done=jnp.asarray(False),
+            target_items=jnp.array([target_a, target_b]),
+            shuffled_menus=jnp.stack([menu_a, menu_b]),
+            selected_correctly=jnp.array([False, False]),
+            first_selection_correct=jnp.array([False, False]),
+            has_selected=jnp.array([False, False]),
+            has_arrived=jnp.array([False, False]),
+            selection_attempts=jnp.zeros((self.num_doers,), dtype=jnp.int32),
+            selected_option_idx=jnp.array([-1, -1]),
+        )
+        return self._split_observations(state), state
+
+    def reset_batch(
+        self,
+        keys: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        return jax.vmap(self.reset, in_axes=(0, None))(keys, fixed_positions)
+
+    def _resolve_actions(self, positions: jnp.ndarray, actions: jnp.ndarray):
+        deltas = jnp.asarray(
+            [
+                [0, 0],
+                [-1, 0],
+                [0, 1],
+                [1, 0],
+                [0, -1],
+            ],
+            dtype=jnp.int32,
+        )
+        raw_targets = positions + deltas[actions]
+        target_walls = self._wall_map[raw_targets[:, 0], raw_targets[:, 1]]
+        wall_hits = jnp.logical_and(actions != 0, target_walls)
+        proposed = jnp.where(target_walls[:, None], positions, raw_targets)
+
+        same_target = jnp.all(proposed[0] == proposed[1])
+        swap_positions = jnp.logical_and(
+            jnp.all(proposed[0] == positions[1]),
+            jnp.all(proposed[1] == positions[0]),
+        )
+        a_into_b = jnp.logical_and(
+            jnp.all(proposed[0] == positions[1]),
+            jnp.all(proposed[1] == positions[1]),
+        )
+        b_into_a = jnp.logical_and(
+            jnp.all(proposed[1] == positions[0]),
+            jnp.all(proposed[0] == positions[0]),
+        )
+        collision = jnp.logical_or(jnp.logical_or(same_target, swap_positions), jnp.logical_or(a_into_b, b_into_a))
+
+        collision_blocks = jnp.asarray(
+            [
+                jnp.logical_or(same_target, jnp.logical_or(swap_positions, a_into_b)),
+                jnp.logical_or(same_target, jnp.logical_or(swap_positions, b_into_a)),
+            ],
+            dtype=bool,
+        )
+        final_positions = jnp.where(collision_blocks[:, None], positions, proposed)
+        return final_positions, wall_hits, collision_blocks
+
+    def step(
+        self,
+        key: jnp.ndarray,
+        state: TwoDoerState,
+        actions: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        def reset_branch(_):
+            reset_obs, reset_state = self.reset(key, fixed_positions=fixed_positions)
+            zeros = jnp.asarray(0.0, dtype=jnp.float32)
+            info = {
+                "task_reward": zeros,
+                "individual_selection_reward": zeros,
+                "wrong_selection_penalty": zeros,
+                "valid_selection_count": zeros,
+                "correct_selection_count": zeros,
+                "progress_reward_per_doer": jnp.zeros((self.num_doers,), dtype=jnp.float32),
+                "step_penalty": zeros,
+                "wall_penalty": zeros,
+                "collision_penalty": zeros,
+                "goal_distance": self._manhattan_distance(reset_state.positions, reset_state.goals),
+                "success": jnp.asarray(False),
+                "eventual_success": jnp.asarray(False),
+                "first_try_success": jnp.asarray(False),
+                "failed": jnp.asarray(False),
+            }
+            return reset_obs, reset_state, zeros, jnp.asarray(False), info
+
+        def step_branch(_):
+            phase_max_steps = self.phase_max_steps
+            nav_actions = jnp.where(actions < 5, actions, 0)
+            select_actions = actions - 5
+            is_selecting = actions >= 5
+            at_goal = jnp.all(state.positions == state.goals, axis=-1)
+            pick_available = jnp.logical_or(
+                ~self.is_pick_object_phase,
+                state.step_count >= self.pick_object_listen_steps,
+            )
+
+            valid_selection = jnp.logical_and(is_selecting, at_goal)
+            valid_selection = jnp.logical_and(valid_selection, pick_available)
+            valid_selection = jnp.logical_and(valid_selection, ~state.has_selected)
+
+            chosen_item = jnp.take_along_axis(state.shuffled_menus, select_actions[:, None], axis=1)[:, 0]
+            is_correct = chosen_item == state.target_items
+            
+            new_selection_attempts = state.selection_attempts + valid_selection.astype(jnp.int32)
+            first_selection = jnp.logical_and(valid_selection, state.selection_attempts == 0)
+            correct_selection = jnp.logical_and(first_selection, is_correct)
+            wrong_selection = jnp.logical_and(first_selection, ~is_correct)
+            new_selected_correctly = jnp.logical_or(state.selected_correctly, correct_selection)
+            new_first_selection_correct = jnp.logical_or(
+                state.first_selection_correct,
+                correct_selection,
+            )
+            new_has_selected = jnp.logical_or(
+                state.has_selected,
+                first_selection,
+            )
+
+            if self.is_pick_object_phase:
+                next_positions = state.positions
+                new_distances = self._manhattan_distance(next_positions, state.goals)
+                progress_reward_per_doer = jnp.zeros((self.num_doers,), dtype=jnp.float32)
+                progress_reward = jnp.asarray(0.0, dtype=jnp.float32)
+                wall_penalty = jnp.asarray(0.0, dtype=jnp.float32)
+                collision_penalty = jnp.asarray(0.0, dtype=jnp.float32)
+                new_has_arrived = jnp.ones((self.num_doers,), dtype=bool)
+                arrival_reward = jnp.asarray(0.0, dtype=jnp.float32)
+            else:
+                old_distances = self._manhattan_distance(state.positions, state.goals)
+                next_positions, wall_hits, collision_blocks = self._resolve_actions(state.positions, nav_actions)
+
+                # Lock position if selecting on this step or if already selected previously
+                is_locked = jnp.logical_or(is_selecting, state.has_selected)
+                next_positions = jnp.where(is_locked[:, None], state.positions, next_positions)
+
+                new_distances = self._manhattan_distance(next_positions, state.goals)
+                progress_reward_per_doer = (old_distances - new_distances) * self.progress_reward_scale
+                progress_reward = progress_reward_per_doer.sum()
+                wall_penalty = self.wall_penalty * wall_hits.astype(jnp.float32).sum()
+                collision_penalty = (
+                    self.collision_penalty * collision_blocks.astype(jnp.float32).sum()
+                )
+
+                arrived_this_step = jnp.all(next_positions == state.goals, axis=-1)
+                new_has_arrived = jnp.logical_or(state.has_arrived, arrived_this_step)
+
+                team_just_arrived = jnp.logical_and(
+                    jnp.all(new_has_arrived),
+                    ~jnp.all(state.has_arrived)
+                )
+                arrival_reward = jnp.where(
+                    team_just_arrived,
+                    self.arrival_reward,
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                )
+            
+            new_selected_option_idx = jnp.where(
+                valid_selection,
+                select_actions,
+                state.selected_option_idx
+            )
+
+            individual_selection_reward = (
+                correct_selection.astype(jnp.float32) * self.individual_selection_reward
+            ).sum()
+            wrong_selection_penalty = (
+                wrong_selection.astype(jnp.float32) * self.wrong_selection_penalty
+            ).sum()
+            valid_selection_count = valid_selection.astype(jnp.float32).sum()
+            correct_selection_count = correct_selection.astype(jnp.float32).sum()
+
+            all_terminal = jnp.all(new_has_selected)
+            all_success = jnp.logical_and(all_terminal, jnp.all(new_first_selection_correct))
+            first_try_success = all_success
+            
+            team_completion_reward = jnp.where(
+                all_success,
+                self.goal_reward,
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+            task_reward = team_completion_reward + individual_selection_reward
+
+            reward = (
+                task_reward
+                + progress_reward
+                + arrival_reward
+                - jnp.where(
+                    jnp.logical_and(self.is_pick_object_phase, state.step_count < self.pick_object_listen_steps),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    self.step_penalty,
+                )
+                - wrong_selection_penalty
+                - wall_penalty
+                - collision_penalty
+            )
+            next_state = TwoDoerState(
+                positions=next_positions,
+                goals=state.goals,
+                step_count=state.step_count + 1,
+                done=jnp.logical_or(all_terminal, state.step_count + 1 >= phase_max_steps),
+                target_items=state.target_items,
+                shuffled_menus=state.shuffled_menus,
+                selected_correctly=new_selected_correctly,
+                first_selection_correct=new_first_selection_correct,
+                has_selected=new_has_selected,
+                has_arrived=new_has_arrived,
+                selection_attempts=new_selection_attempts,
+                selected_option_idx=new_selected_option_idx,
+            )
+            info = {
+                "task_reward": team_completion_reward,
+                "individual_selection_reward": individual_selection_reward,
+                "wrong_selection_penalty": wrong_selection_penalty,
+                "valid_selection_count": valid_selection_count,
+                "correct_selection_count": correct_selection_count,
+                "progress_reward_per_doer": progress_reward_per_doer,
+                "step_penalty": jnp.where(
+                    jnp.logical_and(self.is_pick_object_phase, state.step_count < self.pick_object_listen_steps),
+                    jnp.asarray(0.0, dtype=jnp.float32),
+                    self.step_penalty,
+                ),
+                "wall_penalty": wall_penalty,
+                "collision_penalty": collision_penalty,
+                "goal_distance": new_distances,
+                "success": all_success,
+                "eventual_success": all_success,
+                "first_try_success": first_try_success,
+                "failed": jnp.logical_and(next_state.done, ~all_success),
+            }
+            return self._split_observations(next_state), next_state, reward, next_state.done, info
+
+        return jax.lax.cond(state.done, reset_branch, step_branch, operand=None)
+
+    def step_batch(
+        self,
+        keys: jnp.ndarray,
+        states: TwoDoerState,
+        actions: jnp.ndarray,
+        fixed_positions: jnp.ndarray = UNSET_TWO_DOER_POSITIONS,
+    ):
+        return jax.vmap(self.step, in_axes=(0, 0, 0, None))(keys, states, actions, fixed_positions)
+
+    def render(self, state: TwoDoerState) -> np.ndarray:
+        tile = self.render_tile_size
+        frame = np.ones((self.grid_height * tile, self.grid_width * tile, 3), dtype=np.float32) * 0.96
+
+        wall_color = np.array([0.18, 0.18, 0.22], dtype=np.float32)
+        corridor_color = np.array([0.98, 0.88, 0.45], dtype=np.float32)
+
+        wall_map = np.asarray(self._wall_map)
+        for row in range(self.grid_height):
+            for col in range(self.grid_width):
+                y0 = row * tile
+                y1 = (row + 1) * tile
+                x0 = col * tile
+                x1 = (col + 1) * tile
+                if wall_map[row, col]:
+                    frame[y0:y1, x0:x1] = wall_color
+
+        for col in range(self._corridor_start_col, self._corridor_end_col):
+            y0 = self._corridor_row * tile
+            y1 = (self._corridor_row + 1) * tile
+            x0 = col * tile
+            x1 = (col + 1) * tile
+            frame[y0:y1, x0:x1] = corridor_color
+
+        for agent_idx in range(self.num_doers):
+            goal_row, goal_col = np.asarray(state.goals[agent_idx]).tolist()
+            y0 = goal_row * tile
+            x0 = goal_col * tile
+            inset = 2
+            frame[
+                y0 + inset:(goal_row + 1) * tile - inset,
+                x0 + inset:(goal_col + 1) * tile - inset,
+            ] = np.asarray(self._agent_colors[agent_idx])
+
+        yy, xx = np.mgrid[0:tile, 0:tile]
+        left_triangle = np.logical_and(xx >= tile // 5, np.abs(yy - tile // 2) <= xx - tile // 5)
+        right_triangle = np.logical_and(
+            xx <= tile - tile // 5 - 1,
+            np.abs(yy - tile // 2) <= (tile - tile // 5 - 1) - xx,
+        )
+
+        for agent_idx in range(self.num_doers):
+            row, col = np.asarray(state.positions[agent_idx]).tolist()
+            y0 = row * tile
+            x0 = col * tile
+            tile_view = frame[y0:(row + 1) * tile, x0:(col + 1) * tile]
+            triangle_mask = right_triangle if agent_idx == 0 else left_triangle
+            tile_view[triangle_mask] = np.asarray(self._agent_colors[agent_idx])
+            frame[y0:(row + 1) * tile, x0:(col + 1) * tile] = tile_view
+
+        target_ring = np.array([0.95, 0.75, 0.10], dtype=np.float32)
+        correct_ring = np.array([0.18, 0.72, 0.28], dtype=np.float32)
+        wrong_ring = np.array([0.88, 0.22, 0.22], dtype=np.float32)
+
+        # Render target and menu options on the outer columns.
+        bank = np.asarray(self.item_bank)
+        for agent_idx in range(self.num_doers):
+            offset_y, offset_x = (tile - 15) // 2, (tile - 15) // 2
+
+            side_col = (self.grid_width - 1) * tile if agent_idx == 0 else 0
+            target_id = int(np.asarray(state.target_items[agent_idx]))
+            target_img = bank[target_id]
+            target_upscaled = np.repeat(np.repeat(target_img, 3, axis=0), 3, axis=1)
+            target_y0 = tile
+            frame[target_y0 + offset_y - 2: target_y0 + offset_y + 17, side_col + offset_x - 2: side_col + offset_x + 17] = target_ring
+            frame[target_y0 + offset_y: target_y0 + offset_y + 15, side_col + offset_x: side_col + offset_x + 15] = target_upscaled
+
+            menus = np.asarray(state.shuffled_menus[agent_idx])
+            has_sel = bool(np.asarray(state.selection_attempts[agent_idx] > 0))
+            sel_idx = int(np.asarray(state.selected_option_idx[agent_idx]))
+            
+            for m_idx, option_id in enumerate(menus):
+                opt_img = bank[option_id]
+                opt_upscaled = np.repeat(np.repeat(opt_img, 3, axis=0), 3, axis=1)
+
+                my0 = (3 + m_idx) * tile
+                mx0 = side_col
+
+                if int(option_id) == target_id:
+                    frame[
+                        my0 + offset_y - 1: my0 + offset_y + 16,
+                        mx0 + offset_x - 1: mx0 + offset_x + 16,
+                    ] = target_ring
+                if has_sel and sel_idx == m_idx:
+                    picked_ring = correct_ring if int(option_id) == target_id else wrong_ring
+                    frame[
+                        my0 + offset_y - 2: my0 + offset_y + 17,
+                        mx0 + offset_x - 2: mx0 + offset_x + 17,
+                    ] = picked_ring
+
+                frame[my0 + offset_y: my0 + offset_y + 15, mx0 + offset_x: mx0 + offset_x + 15] = opt_upscaled
+
+        return (frame * 255.0).astype(np.uint8)
