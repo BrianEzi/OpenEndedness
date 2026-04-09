@@ -1192,6 +1192,175 @@ def analyze_rollout_messages(episodes, sample_limit=4):
     return analysis
 
 
+def run_fast_pick_events(env, params, seer, doer, hidden_size, num_episodes, rng, num_envs=128):
+    """
+    Collect message→pick events via a JIT-compiled JAX lax.scan rollout.
+
+    Runs `num_envs` environments in parallel for enough steps to see ~num_episodes
+    episodes worth of data. All model calls are fused into a single compiled kernel.
+
+    Returns:
+        messages:     (T, num_envs, num_doers, msg_dim)  float32
+        chosen_items: (T, num_envs, num_doers)            int32   (-1 = no pick / retry)
+        target_items: (T, num_envs, num_doers)            int32
+    where T = steps_per_env = ceil(num_episodes / num_envs) * phase_max_steps.
+    Only first-pick attempts per episode per agent are kept (retries set to -1).
+    """
+    num_doers = env.num_doers
+    max_steps = env.phase_max_steps
+    steps_per_env = ((num_episodes + num_envs - 1) // num_envs + 1) * max_steps
+
+    rng, reset_rng = jax.random.split(rng)
+    obs0, state0 = env.reset_batch(jax.random.split(reset_rng, num_envs))
+
+    init_seer_carry = seer.initialize_carry(batch_size=num_envs, hidden_size=hidden_size)
+    init_doer_carry = jax.tree_util.tree_map(
+        lambda x: x.reshape((num_envs, num_doers, hidden_size)),
+        doer.initialize_carry(batch_size=num_envs * num_doers, hidden_size=hidden_size),
+    )
+
+    active_bits = env.active_message_bits
+
+    def scan_step(carry, step_rng):
+        obs, state, seer_carry, doer_carry = carry
+
+        # --- Seer ---
+        new_seer_carry, messages, _, _ = seer.apply(
+            {"params": params["seer"]},
+            seer_carry,
+            obs["global_map"],
+            obs["symbolic_state"],
+            obs["target_images"],
+        )
+        messages = hard_mask_inactive_message_bits(messages, active_bits=active_bits)
+        # messages: (num_envs, num_doers, msg_dim)
+
+        # --- Doer ---
+        flat_lv   = obs["local_views"].reshape((num_envs * num_doers,) + obs["local_views"].shape[2:])
+        flat_prop = obs["proprioceptions"].reshape((num_envs * num_doers,) + obs["proprioceptions"].shape[2:])
+        flat_msg  = messages.reshape((num_envs * num_doers,) + messages.shape[2:])
+        flat_menu = obs["menu_images"].reshape((num_envs * num_doers,) + obs["menu_images"].shape[2:])
+        flat_dc   = jax.tree_util.tree_map(lambda x: x.reshape((num_envs * num_doers, hidden_size)), doer_carry)
+
+        new_flat_dc, flat_logits = doer.apply(
+            {"params": params["doer"]}, flat_dc, flat_lv, flat_prop, flat_msg, flat_menu,
+        )
+
+        logits_2d = flat_logits.reshape((num_envs, num_doers, flat_logits.shape[-1]))
+        masked = mask_pick_actions_until_menu_visible(
+            logits_2d, obs["menu_images"],
+            pick_only_phase=env.is_pick_object_phase,
+            pick_available=obs["pick_available"],
+        )
+        actions = jnp.argmax(masked, axis=-1).astype(jnp.int32)  # (num_envs, num_doers)
+
+        # --- Chosen items (first pick only; retries → -1) ---
+        is_pick       = actions >= 5
+        is_first_pick = jnp.logical_and(is_pick, ~state.has_selected)
+        pick_slot     = jnp.clip(actions - 5, 0, 3)
+        env_idx       = jnp.arange(num_envs)[:, None]
+        doer_idx      = jnp.arange(num_doers)[None, :]
+        chosen_items  = state.shuffled_menus[env_idx, doer_idx, pick_slot]
+        chosen_items  = jnp.where(is_first_pick, chosen_items, jnp.full_like(chosen_items, -1))
+
+        # --- Env step ---
+        step_keys = jax.random.split(step_rng, num_envs)
+        next_obs, next_state, _, done, _ = env.step_batch(step_keys, state, actions)
+        # done: (num_envs,)
+
+        # Reset LSTM carries for finished episodes
+        new_seer_carry = jax.tree_util.tree_map(
+            lambda new, zero: jnp.where(done[:, None], zero, new),
+            new_seer_carry, init_seer_carry,
+        )
+        new_doer_carry = jax.tree_util.tree_map(
+            lambda x: x.reshape((num_envs, num_doers, hidden_size)), new_flat_dc,
+        )
+        new_doer_carry = jax.tree_util.tree_map(
+            lambda new, zero: jnp.where(done[:, None, None], zero, new),
+            new_doer_carry, init_doer_carry,
+        )
+
+        record = {
+            "messages":     messages,                # (num_envs, num_doers, msg_dim)
+            "chosen_items": chosen_items,            # (num_envs, num_doers)
+            "target_items": state.target_items,      # (num_envs, num_doers)
+        }
+        return (next_obs, next_state, new_seer_carry, new_doer_carry), record
+
+    print(f"  Compiling fast rollout ({num_envs} envs × {steps_per_env} steps)…")
+    _, records = jax.lax.scan(
+        scan_step,
+        (obs0, state0, init_seer_carry, init_doer_carry),
+        jax.random.split(rng, steps_per_env),
+    )
+    jax.block_until_ready(records)
+    print(f"  Done. Collected {int(jnp.sum(records['chosen_items'] >= 0))} pick events.")
+    return records
+
+
+def analyze_fast_pick_correlations(records):
+    """
+    Convert fast rollout records into per-doer message→pick correlation summaries.
+    Shares the same output schema as analyze_empirical_pick_correlations.
+    """
+    messages     = np.asarray(records["messages"])      # (T, E, D, msg_dim)
+    chosen_items = np.asarray(records["chosen_items"])  # (T, E, D)
+    target_items = np.asarray(records["target_items"])  # (T, E, D)
+
+    results = {}
+    for doer_idx, doer_key in enumerate(DOER_KEYS):
+        msgs_flat    = messages[:, :, doer_idx, :].reshape(-1, messages.shape[-1])
+        chosen_flat  = chosen_items[:, :, doer_idx].reshape(-1)
+        target_flat  = target_items[:, :, doer_idx].reshape(-1)
+
+        pick_mask   = chosen_flat >= 0
+        msgs_pick   = msgs_flat[pick_mask]
+        chosen_pick = chosen_flat[pick_mask]
+        target_pick = target_flat[pick_mask]
+
+        buckets = {}
+        for i in range(len(chosen_pick)):
+            msg = tuple(int(x) for x in msgs_pick[i])
+            ci  = int(chosen_pick[i])
+            ti  = int(target_pick[i])
+            if msg not in buckets:
+                buckets[msg] = {
+                    "item_counts": Counter(), "color_counts": Counter(),
+                    "shape_counts": Counter(), "correct": 0, "total": 0,
+                }
+            b = buckets[msg]
+            b["total"] += 1
+            b["item_counts"][ci] += 1
+            b["color_counts"][COLOR_NAMES[ci // 4]] += 1
+            b["shape_counts"][SHAPE_NAMES[ci % 4]] += 1
+            if ci == ti:
+                b["correct"] += 1
+
+        summary = {}
+        for msg, b in sorted(buckets.items(), key=lambda x: -x[1]["total"]):
+            n = b["total"]
+            top_item_id, top_item_n = b["item_counts"].most_common(1)[0]
+            top_color,   top_color_n = b["color_counts"].most_common(1)[0]
+            top_shape,   top_shape_n = b["shape_counts"].most_common(1)[0]
+            summary[str(msg)] = {
+                "message":      list(msg),
+                "n_picks":      n,
+                "correct_rate": b["correct"] / n,
+                "top_item":     item_label(top_item_id),
+                "top_item_rate": top_item_n / n,
+                "top_color":    top_color,
+                "top_color_rate": top_color_n / n,
+                "top_shape":    top_shape,
+                "top_shape_rate": top_shape_n / n,
+                "item_counts":  {item_label(k): v for k, v in b["item_counts"].items()},
+                "color_counts": dict(b["color_counts"]),
+                "shape_counts": dict(b["shape_counts"]),
+            }
+        results[doer_key] = summary
+    return results
+
+
 def analyze_empirical_pick_correlations(episodes):
     """
     For each unique message seen at a pick step, record what was picked.
@@ -1392,17 +1561,14 @@ def main():
     doer = Doer(fsq_levels=fsq_levels, num_actions=env.num_actions)
 
     rng = jax.random.PRNGKey(args.seed)
+
+    # --- GIF episodes (slow Python loop, only for visualizations) ---
     episodes = []
-    for episode_idx in range(args.num_episodes):
-        gif_path = None
-        if episode_idx < args.num_visualizations:
-            gif_path = gifs_dir / f"greedy_episode_{episode_idx:03d}.gif"
+    num_gif_episodes = min(args.num_visualizations, args.num_episodes)
+    for episode_idx in range(num_gif_episodes):
+        gif_path = gifs_dir / f"greedy_episode_{episode_idx:03d}.gif"
         rng, episode_record = run_policy_episode(
-            env,
-            params,
-            rng,
-            seer,
-            doer,
+            env, params, rng, seer, doer,
             hidden_size=args.hidden_size,
             max_steps=env.phase_max_steps,
             gif_path=gif_path,
@@ -1415,12 +1581,27 @@ def main():
 
     empirical_analysis = analyze_rollout_messages(episodes)
     empirical_summary_lines = build_empirical_summary_lines(
-        empirical_analysis,
-        limit=args.print_summary_limit,
+        empirical_analysis, limit=args.print_summary_limit,
     )
 
-    pick_correlations = analyze_empirical_pick_correlations(episodes)
+    # --- Fast batched rollout for correlation analysis ---
+    print(f"Running fast batched rollout ({args.num_episodes} episodes)…")
+    rng, fast_rng = jax.random.split(rng)
+    fast_records = run_fast_pick_events(
+        env, params, seer, doer,
+        hidden_size=args.hidden_size,
+        num_episodes=args.num_episodes,
+        rng=fast_rng,
+    )
+    pick_correlations = analyze_fast_pick_correlations(fast_records)
     bit_compositionality = analyze_empirical_bit_compositionality(pick_correlations, fsq_levels)
+
+    # Success rate estimated from fast rollout: fraction of steps that were correct picks
+    # (rough proxy — use GIF episodes for exact per-episode success if needed)
+    chosen = np.asarray(fast_records["chosen_items"])
+    target = np.asarray(fast_records["target_items"])
+    pick_mask = chosen >= 0
+    success_rate = float(np.sum((chosen == target) & pick_mask) / max(1, np.sum(pick_mask)))
 
     nav_env, nav_obs, pick_env, pick_obs = build_eval_contexts(args)
 
@@ -1466,7 +1647,6 @@ def main():
         semantic_map, fsq_levels, limit=args.print_summary_limit,
     )
 
-    success_rate = sum(1 for episode in episodes if episode["success"]) / max(len(episodes), 1)
     report = {
         "checkpoint_requested": args.checkpoint,
         "checkpoint_resolved": str(resolved_checkpoint),
@@ -1492,8 +1672,9 @@ def main():
             "message-pair statistics from real greedy episodes."
         ),
         "greedy_eval": {
-            "num_episodes": len(episodes),
-            "success_rate": success_rate,
+            "num_gif_episodes": len(episodes),
+            "num_fast_episodes_requested": args.num_episodes,
+            "pick_correct_rate": success_rate,
             "visualization_paths": [
                 episode["gif_path"] for episode in episodes if "gif_path" in episode
             ],
@@ -1526,7 +1707,7 @@ def main():
     report_path.write_text(json.dumps(report, indent=2))
 
     print(f"Resolved checkpoint: {resolved_checkpoint}")
-    print(f"Greedy rollout success rate: {success_rate:.3f} over {len(episodes)} episodes")
+    print(f"Pick correct rate (fast rollout, {args.num_episodes} eps): {success_rate:.3f}")
     print(f"Saved greedy traces to {traces_path}")
     print(f"Saved communication report to {report_path}")
     print("")
