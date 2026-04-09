@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import json; nb = json.load\\(open\\('train.ipynb'\\)\\); [print\\(i, c['source'][:200] if c['source'] else ''\\) for i, c in enumerate\\(nb['cells']\\)]\")",
+      "Bash(python3 -c ':*)"
+    ]
+  }
+}
