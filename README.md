@@ -4,6 +4,8 @@ This project explores the development of **emergent communication protocols** be
 
 ---
 
+![Emergent Communication Demo](v2_JaxMarl/greedy_episode_000.gif)
+
 ## 🎯 Project Objective
 
 The primary goal is to solve a **coordination deadlock** in a grid-world environment. Two agents (Doers) must swap sides through a narrow, single-tile-wide corridor. This requires precise timing and spatial awareness.
