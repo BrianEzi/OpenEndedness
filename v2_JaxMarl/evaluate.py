@@ -733,6 +733,62 @@ def probe_navigation_semantics(doer, doer_params, nav_obs, fsq_levels, sequence_
     return results
 
 
+def probe_navigation_consistency(doer, doer_params, nav_env, fsq_levels, hidden_size):
+    """Run nav probe across all candidate row positions; return modal action + consistency.
+
+    Uses nav_env._candidate_rows (typically 4 rows) × left/right col positions per doer.
+    For each message, computes what fraction of positions agree on the same action.
+
+    Returns dict: doer_key → {msg_key: {modal_action, consistency, action_counts}}
+    """
+    candidate_rows = np.asarray(nav_env._candidate_rows)  # e.g. [1, 2, H-3, H-2]
+
+    sequences = all_message_sequences(fsq_levels, 1)
+    all_seqs_array = jnp.asarray(sequences, dtype=jnp.float32)  # (N, 1, msg_dim)
+    zero_menu = jnp.zeros((1, 4, 5, 5, 3), dtype=jnp.float32)
+
+    # Accumulate per-context actions: doer_key → msg_key → [action, ...]
+    per_msg_actions = {
+        dk: {message_sequence_key(seq): [] for seq in sequences}
+        for dk in DOER_KEYS
+    }
+
+    for row in candidate_rows:
+        fixed_positions = jnp.asarray(
+            [[int(row), nav_env._left_col], [int(row), nav_env._right_col]],
+            dtype=jnp.int32,
+        )
+        nav_obs, _ = nav_env.reset(jax.random.PRNGKey(0), fixed_positions=fixed_positions)
+
+        for doer_idx, doer_key in enumerate(DOER_KEYS):
+            local_obs = nav_obs["local_views"][doer_idx][None, ...]
+            proprioception = nav_obs["proprioceptions"][doer_idx][None, ...]
+            action_traces = run_doer_sequences_batched(
+                doer, doer_params, local_obs, proprioception,
+                all_seqs_array, zero_menu,
+                hidden_size=hidden_size,
+                pick_only_phase=False,
+                pick_available_sequence=[False],
+            )  # (N, 1)
+            for seq_idx, seq in enumerate(sequences):
+                action = int(action_traces[seq_idx, 0])
+                per_msg_actions[doer_key][message_sequence_key(seq)].append(action)
+
+    results = {}
+    for doer_key in DOER_KEYS:
+        results[doer_key] = {}
+        for msg_key, actions in per_msg_actions[doer_key].items():
+            counter = Counter(actions)
+            modal_action, modal_count = counter.most_common(1)[0]
+            consistency = modal_count / len(actions)
+            results[doer_key][msg_key] = {
+                "modal_action": action_label(modal_action),
+                "consistency": consistency,
+                "action_counts": {action_label(a): c for a, c in counter.items()},
+            }
+    return results
+
+
 def probe_selection_semantics(
     doer,
     doer_params,
@@ -881,10 +937,11 @@ def probe_selection_semantics(
     return results
 
 
-def build_message_semantic_map(single_nav_results, single_sel_results, fsq_levels):
+def build_message_semantic_map(single_nav_results, single_sel_results, fsq_levels,
+                               nav_consistency=None):
     """For each of the N single messages, return its best nav action and best item/color/shape.
 
-    Returns dict: doer_key → {msg_key: {action, item, color, shape, hit_rate}}
+    Returns dict: doer_key → {msg_key: {action, nav_consistency, item, color, shape, hit_rate}}
     """
     semantic_map = {}
     for doer_key in DOER_KEYS:
@@ -900,9 +957,12 @@ def build_message_semantic_map(single_nav_results, single_sel_results, fsq_level
                 shape = parts[1] if len(parts) == 2 else "?"
             else:
                 color, shape = "?", "?"
+            cons_entry = nav_consistency[doer_key].get(seq_key, {}) if nav_consistency else {}
             mapping[str(list(msg_tuple))] = {
                 "msg": list(msg_tuple),
-                "nav_action": nav.get("final_action", "?"),
+                "nav_action": cons_entry.get("modal_action", nav.get("final_action", "?")),
+                "nav_consistency": cons_entry.get("consistency", None),
+                "nav_action_counts": cons_entry.get("action_counts", {}),
                 "best_item": best_label,
                 "color": color,
                 "shape": shape,
@@ -952,8 +1012,10 @@ def build_single_message_summary_lines(semantic_map, compositionality):
         lines.append(f"\n{doer_key}:")
         lines.append("  Single messages:")
         for msg_key, entry in semantic_map[doer_key].items():
+            cons = entry.get("nav_consistency")
+            cons_str = f"{cons:.2f}" if cons is not None else "n/a"
             lines.append(
-                f"    msg={msg_key:20s} | nav={entry['nav_action']:6s} "
+                f"    msg={msg_key:20s} | nav={entry['nav_action']:6s} (cons={cons_str}) "
                 f"| item={entry['best_item'] or '?':20s} (hit={entry['hit_rate']:.2f}) "
                 f"| color={entry['color']:8s} | shape={entry['shape']}"
             )
@@ -1281,10 +1343,15 @@ def run_fast_pick_events(env, params, seer, doer, hidden_size, num_episodes, rng
             new_doer_carry, init_doer_carry,
         )
 
+        # --- Nav actions: record movement steps (action < 5), mask pick steps with -1 ---
+        is_nav = actions < 5
+        nav_actions = jnp.where(is_nav, actions, jnp.full_like(actions, -1))  # (num_envs, num_doers)
+
         record = {
             "messages":     messages,                # (num_envs, num_doers, msg_dim)
             "chosen_items": chosen_items,            # (num_envs, num_doers)
             "target_items": state.target_items,      # (num_envs, num_doers)
+            "nav_actions":  nav_actions,             # (num_envs, num_doers)  -1 = pick step
         }
         return (next_obs, next_state, new_seer_carry, new_doer_carry), record
 
@@ -1295,7 +1362,9 @@ def run_fast_pick_events(env, params, seer, doer, hidden_size, num_episodes, rng
         jax.random.split(rng, steps_per_env),
     )
     jax.block_until_ready(records)
-    print(f"  Done. Collected {int(jnp.sum(records['chosen_items'] >= 0))} pick events.")
+    n_picks = int(jnp.sum(records["chosen_items"] >= 0))
+    n_nav   = int(jnp.sum(records["nav_actions"] >= 0))
+    print(f"  Done. Collected {n_picks} pick events and {n_nav} nav-action events.")
     return records
 
 
@@ -1356,6 +1425,53 @@ def analyze_fast_pick_correlations(records):
                 "item_counts":  {item_label(k): v for k, v in b["item_counts"].items()},
                 "color_counts": dict(b["color_counts"]),
                 "shape_counts": dict(b["shape_counts"]),
+            }
+        results[doer_key] = summary
+    return results
+
+
+def analyze_fast_nav_correlations(records):
+    """
+    Convert fast rollout records into per-doer message→nav-action correlation summaries.
+
+    For every step where the doer took a navigation action (0-4 = STAY/UP/DOWN/LEFT/RIGHT),
+    record what message was broadcast and which action was taken.
+
+    Returns dict: doer_key → {msg_str: {message, n_steps, top_action, top_action_rate,
+                                         action_counts, action_purity}}
+    """
+    messages    = np.asarray(records["messages"])    # (T, E, D, msg_dim)
+    nav_actions = np.asarray(records["nav_actions"]) # (T, E, D)  -1 = pick step
+
+    results = {}
+    for doer_idx, doer_key in enumerate(DOER_KEYS):
+        msgs_flat = messages[:, :, doer_idx, :].reshape(-1, messages.shape[-1])
+        nav_flat  = nav_actions[:, :, doer_idx].reshape(-1)
+
+        nav_mask  = nav_flat >= 0
+        msgs_nav  = msgs_flat[nav_mask]
+        acts_nav  = nav_flat[nav_mask]
+
+        buckets = {}
+        for i in range(len(acts_nav)):
+            msg = tuple(int(x) for x in msgs_nav[i])
+            act = int(acts_nav[i])
+            if msg not in buckets:
+                buckets[msg] = {"action_counts": Counter(), "total": 0}
+            buckets[msg]["action_counts"][act] += 1
+            buckets[msg]["total"] += 1
+
+        summary = {}
+        for msg, b in sorted(buckets.items(), key=lambda x: -x[1]["total"]):
+            n = b["total"]
+            top_act, top_n = b["action_counts"].most_common(1)[0]
+            summary[str(msg)] = {
+                "message":         list(msg),
+                "n_steps":         n,
+                "top_action":      action_label(top_act),
+                "top_action_rate": top_n / n,
+                "action_purity":   top_n / n,
+                "action_counts":   {action_label(a): c for a, c in b["action_counts"].items()},
             }
         results[doer_key] = summary
     return results
@@ -1482,22 +1598,32 @@ def analyze_empirical_bit_compositionality(pick_correlations, fsq_levels):
     return results
 
 
-def print_empirical_pick_correlations(pick_correlations, bit_compositionality, limit=20):
+def print_empirical_pick_correlations(pick_correlations, bit_compositionality, limit=20,
+                                       semantic_map=None):
     for doer_key in DOER_KEYS:
         summary = pick_correlations[doer_key]
-        print(f"\n{'='*80}")
+        sem = semantic_map[doer_key] if semantic_map else {}
+        print(f"\n{'='*100}")
         print(f"  {doer_key.upper()} — Empirical Message→Pick Correlations (first pick per episode)")
-        print(f"{'='*80}")
-        header = f"{'Message':<22} {'N':>5}  {'Top Item':<26} {'Top Color':<18} {'Top Shape':<18} {'Correct%':>8}"
+        print(f"{'='*100}")
+        header = (
+            f"{'Message':<22} {'N':>5}  {'Nav':>6} {'NavCons':>8}  "
+            f"{'Top Item':<26} {'Top Color':<18} {'Top Shape':<18} {'Correct%':>8}"
+        )
         print(header)
         print("-" * len(header))
         for entry in list(summary.values())[:limit]:
             msg_str = str(entry["message"])
+            sem_entry = sem.get(str(entry["message"]), {})
+            nav_action = sem_entry.get("nav_action", "?")
+            nav_cons = sem_entry.get("nav_consistency")
+            nav_cons_str = f"{nav_cons:.2f}" if nav_cons is not None else "  n/a"
             item_str = f"{entry['top_item']} ({entry['top_item_rate']:.2f})"
             color_str = f"{entry['top_color']} ({entry['top_color_rate']:.2f})"
             shape_str = f"{entry['top_shape']} ({entry['top_shape_rate']:.2f})"
             print(
-                f"{msg_str:<22} {entry['n_picks']:>5}  {item_str:<26} {color_str:<18} {shape_str:<18} {entry['correct_rate']:>8.2f}"
+                f"{msg_str:<22} {entry['n_picks']:>5}  {nav_action:>6} {nav_cons_str:>8}  "
+                f"{item_str:<26} {color_str:<18} {shape_str:<18} {entry['correct_rate']:>8.2f}"
             )
 
         print(f"\n  Bit-level compositionality ({doer_key}):")
@@ -1513,6 +1639,26 @@ def print_empirical_pick_correlations(pick_correlations, bit_compositionality, l
                     f"shape→{g['top_shape']} ({g['shape_purity']:.2f})"
                 )
             print(f"    bit {bit_idx}: " + "  //  ".join(parts))
+
+
+def print_nav_correlations(nav_correlations, limit=20):
+    """Print message→navigation-action correlation table from empirical rollouts."""
+    for doer_key in DOER_KEYS:
+        summary = nav_correlations[doer_key]
+        print(f"\n{'='*70}")
+        print(f"  {doer_key.upper()} — Empirical Message→Nav-Action Correlations")
+        print(f"{'='*70}")
+        header = f"{'Message':<22} {'N':>7}  {'Top Action':<10} {'Purity':>7}  {'Action distribution'}"
+        print(header)
+        print("-" * len(header))
+        for entry in list(summary.values())[:limit]:
+            msg_str = str(entry["message"])
+            dist_str = "  ".join(f"{a}:{c}" for a, c in sorted(entry["action_counts"].items(),
+                                                                  key=lambda x: -x[1]))
+            print(
+                f"{msg_str:<22} {entry['n_steps']:>7}  {entry['top_action']:<10} "
+                f"{entry['action_purity']:>7.2f}  {dist_str}"
+            )
 
 
 def build_empirical_summary_lines(empirical_analysis, limit):
@@ -1594,6 +1740,7 @@ def main():
         rng=fast_rng,
     )
     pick_correlations = analyze_fast_pick_correlations(fast_records)
+    nav_correlations  = analyze_fast_nav_correlations(fast_records)
     bit_compositionality = analyze_empirical_bit_compositionality(pick_correlations, fsq_levels)
 
     # Success rate estimated from fast rollout: fraction of steps that were correct picks
@@ -1735,6 +1882,7 @@ def main():
     print_empirical_pick_correlations(
         pick_correlations, bit_compositionality, limit=args.print_summary_limit
     )
+    print_nav_correlations(nav_correlations, limit=args.print_summary_limit)
 
 
 if __name__ == "__main__":
