@@ -4,7 +4,7 @@ This project explores the development of **emergent communication protocols** be
 
 ---
 
-![Emergent Communication Demo](v2_JaxMarl/greedy_episode_000.gif)
+![Emergent Communication Demo](src/greedy_episode_000.gif)
 
 ## 🎯 Project Objective
 
